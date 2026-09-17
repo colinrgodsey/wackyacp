@@ -38,10 +38,10 @@ type AgentCapabilities struct {
 
 // SessionCapabilities defines advertised session methods.
 type SessionCapabilities struct {
-	Resume bool `json:"resume"`
-	List   any  `json:"list,omitempty"`
-	Fork   any  `json:"fork,omitempty"`
-	Close  any  `json:"close,omitempty"`
+	Resume any `json:"resume,omitempty"`
+	List   any `json:"list,omitempty"`
+	Fork   any `json:"fork,omitempty"`
+	Close  any `json:"close,omitempty"`
 }
 
 // InitializeResult represents the result of the ACP initialize handshake.

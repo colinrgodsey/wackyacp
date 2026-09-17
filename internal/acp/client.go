@@ -474,7 +474,8 @@ func (c *Client) LoadSession(ctx context.Context, sessionID, agentFolder string)
 // NewSession creates a fresh session on the harness and returns the sessionID.
 func (c *Client) NewSession(ctx context.Context, agentFolder string) (string, error) {
 	params := map[string]any{
-		"cwd": agentFolder,
+		"cwd":        agentFolder,
+		"mcpServers": []any{},
 		"_meta": map[string]any{
 			"agent_folder": agentFolder,
 		},
@@ -504,7 +505,7 @@ func (c *Client) EstablishSession(ctx context.Context, agentFolder string, saved
 		}
 
 		// 1. Try session/resume if capability advertised
-		if c.Capabilities.SessionCapabilities.Resume {
+		if c.Capabilities.SessionCapabilities.Resume != nil {
 			if err := c.ResumeSession(ctx, saved.SessionID, agentFolder); err == nil {
 				return saved.SessionID, nil
 			} else if errors.Is(err, ErrSessionMismatch) {
