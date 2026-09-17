@@ -47,6 +47,13 @@ type Client struct {
 	activeTurnMu sync.RWMutex
 	activeTurn   *activeTurn
 
+	// PermissionMode controls how session/request_permission from the harness is
+	// answered: "deny" (D117 default) always picks a reject/cancel option so the
+	// harness can never run unapproved side-effecting tools; "approve" always
+	// picks the first allow option so the bridge acts as an approving elbow for
+	// trusted local harnesses (used for Claude via claude-agent-acp).
+	PermissionMode string
+
 	doneCh chan struct{}
 	errMu  sync.RWMutex
 	err    error
@@ -162,12 +169,38 @@ func (c *Client) handleIncomingRequest(line []byte) {
 
 	switch req.Method {
 	case "session/request_permission":
-		// Auto-deny posture (D117 Decision)
 		var params PermissionRequestParams
 		raw, _ := json.Marshal(req.Params)
 		_ = json.Unmarshal(raw, &params)
 
-		// Look for explicit reject/deny option
+		if c.PermissionMode == "approve" {
+			// Approve posture: pick the first allow option so the harness can run
+			// its tools. Only meaningful for trusted local harnesses.
+			var chosenOptionID string
+			for _, opt := range params.Options {
+				if opt.Kind == "allow_once" || opt.Kind == "allow_always" ||
+					strings.Contains(strings.ToLower(opt.Name), "allow") ||
+					strings.Contains(strings.ToLower(opt.OptionID), "allow") {
+					chosenOptionID = opt.OptionID
+					break
+				}
+			}
+			outcome := map[string]any{"outcome": "cancelled"}
+			if chosenOptionID != "" {
+				outcome = map[string]any{"outcome": "selected", "optionId": chosenOptionID}
+			}
+			_ = c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil)
+
+			c.activeTurnMu.RLock()
+			turn := c.activeTurn
+			c.activeTurnMu.RUnlock()
+			if turn != nil && turn.callbacks.OnWarning != nil {
+				_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", params.ToolCall.Title))
+			}
+			break
+		}
+
+		// Auto-deny posture (D117 Decision)
 		var chosenOptionID string
 		for _, opt := range params.Options {
 			if opt.Kind == "reject_once" || opt.Kind == "reject_always" ||
