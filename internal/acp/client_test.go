@@ -67,7 +67,7 @@ func TestClient_Initialize(t *testing.T) {
 	if res.ProtocolVersion != 1 {
 		t.Errorf("expected protocolVersion 1, got %d", res.ProtocolVersion)
 	}
-	if !client.Capabilities.SessionCapabilities.Resume {
+	if client.Capabilities.SessionCapabilities.Resume == nil {
 		t.Errorf("expected resume capability true")
 	}
 }
@@ -160,7 +160,7 @@ func TestClient_EstablishSession_HarnessMismatchFallsBackToNew(t *testing.T) {
 	outReader, outWriter := io.Pipe()
 
 	client := NewClient(outWriter, inReader)
-	client.Capabilities.SessionCapabilities.Resume = true
+	client.Capabilities.SessionCapabilities.Resume = any(true)
 
 	go func() {
 		scanner := bufio.NewScanner(outReader)
