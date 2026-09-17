@@ -21,11 +21,15 @@ type Config struct {
 	Args        []string
 	AgentFolder string
 	Stderr      io.Writer
+	WaitDelay   time.Duration
 }
 
 // Process wraps the running harness subprocess.
 type Process struct {
 	cmd       *exec.Cmd
+	ctx       context.Context
+	cancel    context.CancelFunc
+	waitDelay time.Duration
 	Stdin     io.WriteCloser
 	Stdout    io.ReadCloser
 	closeOnce sync.Once
@@ -51,13 +55,14 @@ func Start(ctx context.Context, cfg Config) (*Process, error) {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, binPath, cfg.Args...)
+	procCtx, procCancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(procCtx, binPath, cfg.Args...)
 	if cfg.AgentFolder != "" {
 		cmd.Dir = cfg.AgentFolder
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-	// Go 1.20+ process-group termination: SIGTERM -> 5s WaitDelay -> SIGKILL
+	// Go 1.20+ process-group termination: SIGTERM -> WaitDelay -> SIGKILL
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
@@ -68,7 +73,12 @@ func Start(ctx context.Context, cfg Config) (*Process, error) {
 		}
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
-	cmd.WaitDelay = 5 * time.Second
+
+	waitDelay := cfg.WaitDelay
+	if waitDelay <= 0 {
+		waitDelay = 5 * time.Second
+	}
+	cmd.WaitDelay = waitDelay
 
 	if cfg.Stderr != nil {
 		cmd.Stderr = cfg.Stderr
@@ -78,28 +88,36 @@ func Start(ctx context.Context, cfg Config) (*Process, error) {
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		procCancel()
 		return nil, fmt.Errorf("creating harness stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		procCancel()
 		_ = stdin.Close()
 		return nil, fmt.Errorf("creating harness stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		procCancel()
 		_ = stdin.Close()
 		_ = stdout.Close()
 		return nil, fmt.Errorf("starting harness process %s: %w", cfg.Command, err)
 	}
 
 	return &Process{
-		cmd:    cmd,
-		Stdin:  stdin,
-		Stdout: stdout,
+		cmd:       cmd,
+		ctx:       procCtx,
+		cancel:    procCancel,
+		waitDelay: waitDelay,
+		Stdin:     stdin,
+		Stdout:    stdout,
 	}, nil
 }
 
 // Close closes the stdio pipes and waits for the process to exit.
+// It unconditionally escalates termination (SIGTERM to -pgid, then SIGKILL after WaitDelay)
+// if the harness does not exit on stdin EOF within a brief grace period.
 func (p *Process) Close() error {
 	p.closeOnce.Do(func() {
 		var stdinErr, stdoutErr error
@@ -109,7 +127,69 @@ func (p *Process) Close() error {
 		if p.Stdout != nil {
 			stdoutErr = p.Stdout.Close()
 		}
-		waitErr := p.cmd.Wait()
+
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- p.cmd.Wait()
+		}()
+
+		waitDelay := p.waitDelay
+		if waitDelay <= 0 {
+			waitDelay = 5 * time.Second
+		}
+
+		var waitErr error
+		if p.ctx.Err() != nil {
+			// Context already canceled: trigger termination immediately
+			if p.cmd.Cancel != nil {
+				_ = p.cmd.Cancel()
+			}
+			if p.cancel != nil {
+				p.cancel()
+			}
+			select {
+			case waitErr = <-waitDone:
+			case <-time.After(waitDelay):
+				if p.cmd.Process != nil {
+					pgid, err := syscall.Getpgid(p.cmd.Process.Pid)
+					if err == nil {
+						_ = syscall.Kill(-pgid, syscall.SIGKILL)
+					} else {
+						_ = p.cmd.Process.Kill()
+					}
+				}
+				waitErr = <-waitDone
+			}
+		} else {
+			// Normal EOF path: allow brief grace period (50ms) for cooperative exit on EOF
+			select {
+			case waitErr = <-waitDone:
+				// Harness exited cleanly on EOF
+			case <-time.After(50 * time.Millisecond):
+				// Harness ignored stdin EOF: escalate to SIGTERM(-pgid)
+				if p.cmd.Cancel != nil {
+					_ = p.cmd.Cancel()
+				}
+				if p.cancel != nil {
+					p.cancel()
+				}
+				select {
+				case waitErr = <-waitDone:
+				case <-time.After(waitDelay):
+					// WaitDelay expired: escalate to SIGKILL(-pgid)
+					if p.cmd.Process != nil {
+						pgid, err := syscall.Getpgid(p.cmd.Process.Pid)
+						if err == nil {
+							_ = syscall.Kill(-pgid, syscall.SIGKILL)
+						} else {
+							_ = p.cmd.Process.Kill()
+						}
+					}
+					waitErr = <-waitDone
+				}
+			}
+		}
+
 		p.closeErr = errors.Join(stdinErr, stdoutErr, waitErr)
 	})
 	return p.closeErr

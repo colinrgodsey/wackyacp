@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -506,6 +507,8 @@ func (c *Client) EstablishSession(ctx context.Context, agentFolder string, saved
 		if c.Capabilities.SessionCapabilities.Resume {
 			if err := c.ResumeSession(ctx, saved.SessionID, agentFolder); err == nil {
 				return saved.SessionID, nil
+			} else if errors.Is(err, ErrSessionMismatch) {
+				fmt.Fprintf(os.Stderr, "wackyacp: warning: session ownership mismatch on resume: %v\n", err)
 			}
 		}
 
@@ -513,6 +516,8 @@ func (c *Client) EstablishSession(ctx context.Context, agentFolder string, saved
 		if c.Capabilities.LoadSession {
 			if err := c.LoadSession(ctx, saved.SessionID, agentFolder); err == nil {
 				return saved.SessionID, nil
+			} else if errors.Is(err, ErrSessionMismatch) {
+				fmt.Fprintf(os.Stderr, "wackyacp: warning: session ownership mismatch on load: %v\n", err)
 			}
 		}
 	}

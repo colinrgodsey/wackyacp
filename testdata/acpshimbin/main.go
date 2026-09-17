@@ -382,6 +382,14 @@ func (s *acpShim) run() error {
 		line, err := s.reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
+				if s.script == "ignore-eof" {
+					done := make(chan struct{})
+					go func() {
+						time.Sleep(1 * time.Hour)
+						close(done)
+					}()
+					<-done
+				}
 				return nil
 			}
 			return err

@@ -85,3 +85,33 @@ func TestHarnessCancel(t *testing.T) {
 		t.Fatalf("expected process to terminate with error on cancel")
 	}
 }
+
+func TestHarnessIgnoreEOF_CloseEscalatesKill(t *testing.T) {
+	ctx := context.Background()
+
+	// Child process reads stdin then sleeps rather than exiting
+	proc, err := Start(ctx, Config{
+		Command:   "sh",
+		Args:      []string{"-c", "cat > /dev/null; sleep 100"},
+		WaitDelay: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- proc.Close()
+	}()
+
+	select {
+	case <-done:
+		elapsed := time.Since(start)
+		if elapsed > 3*time.Second {
+			t.Errorf("expected Close to terminate uncooperative child within WaitDelay bounds, took: %v", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("proc.Close() hung indefinitely on child ignoring stdin EOF")
+	}
+}

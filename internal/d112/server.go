@@ -76,6 +76,11 @@ func translateError(err error) error {
 
 func (s *Server) GenerateTurnStream(req *agentv1.GenerateTurnStreamRequest, stream agentv1.AgentService_GenerateTurnStreamServer) error {
 	ctx := stream.Context()
+	defer func() {
+		if ctx.Err() != nil {
+			_ = s.driver.Cancel(s.sessionID)
+		}
+	}()
 	promptText := "" // default continuation
 
 	callbacks := acp.TurnCallbacks{
@@ -109,6 +114,11 @@ func (s *Server) GenerateTurnStream(req *agentv1.GenerateTurnStreamRequest, stre
 
 func (s *Server) AddAndGenerateTurnStream(req *agentv1.AddAndGenerateTurnStreamRequest, stream agentv1.AgentService_AddAndGenerateTurnStreamServer) error {
 	ctx := stream.Context()
+	defer func() {
+		if ctx.Err() != nil {
+			_ = s.driver.Cancel(s.sessionID)
+		}
+	}()
 	promptText := req.GetUserMessage()
 
 	callbacks := acp.TurnCallbacks{
@@ -142,6 +152,11 @@ func (s *Server) AddAndGenerateTurnStream(req *agentv1.AddAndGenerateTurnStreamR
 }
 
 func (s *Server) GenerateTurn(ctx context.Context, req *agentv1.GenerateTurnRequest) (*agentv1.GenerateTurnResponse, error) {
+	defer func() {
+		if ctx.Err() != nil {
+			_ = s.driver.Cancel(s.sessionID)
+		}
+	}()
 	var sb strings.Builder
 
 	callbacks := acp.TurnCallbacks{
@@ -163,6 +178,11 @@ func (s *Server) GenerateTurn(ctx context.Context, req *agentv1.GenerateTurnRequ
 }
 
 func (s *Server) AddAndGenerateTurn(ctx context.Context, req *agentv1.AddAndGenerateTurnRequest) (*agentv1.AddAndGenerateTurnResponse, error) {
+	defer func() {
+		if ctx.Err() != nil {
+			_ = s.driver.Cancel(s.sessionID)
+		}
+	}()
 	var sb strings.Builder
 	var warnings []string
 

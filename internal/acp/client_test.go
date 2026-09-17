@@ -1,7 +1,11 @@
 package acp
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -144,11 +148,74 @@ func TestClient_EstablishSession_FailLoad_FallbackNew(t *testing.T) {
 	// Verify session file was persisted
 	persisted, err := session.ReadSession(agentDir)
 	if err != nil {
-		t.Fatalf("ReadSession failed: %v", err)
+		t.Fatalf("reading persisted session failed: %v", err)
 	}
 	if persisted.SessionID != "shim-session-fail-load" {
 		t.Errorf("persisted sessionID mismatch: %s", persisted.SessionID)
 	}
+}
+
+func TestClient_EstablishSession_HarnessMismatchFallsBackToNew(t *testing.T) {
+	inReader, inWriter := io.Pipe()
+	outReader, outWriter := io.Pipe()
+
+	client := NewClient(outWriter, inReader)
+	client.Capabilities.SessionCapabilities.Resume = true
+
+	go func() {
+		scanner := bufio.NewScanner(outReader)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			var req map[string]any
+			if err := json.Unmarshal(line, &req); err != nil {
+				continue
+			}
+			method, _ := req["method"].(string)
+			id := req["id"]
+			switch method {
+			case "session/resume":
+				// Return a mismatched agent_folder
+				resp := map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"result": map[string]any{
+						"_meta": map[string]any{
+							"agent_folder": "/different/agent/folder",
+						},
+					},
+				}
+				data, _ := json.Marshal(resp)
+				_, _ = fmt.Fprintf(inWriter, "%s\n", data)
+			case "session/new":
+				resp := map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"result": map[string]any{
+						"sessionId": "fresh-session-after-mismatch",
+					},
+				}
+				data, _ := json.Marshal(resp)
+				_, _ = fmt.Fprintf(inWriter, "%s\n", data)
+			}
+		}
+	}()
+
+	agentDir := t.TempDir()
+	saved := &session.SessionData{
+		SessionID:   "old-session-123",
+		AgentFolder: agentDir,
+	}
+
+	sessionID, err := client.EstablishSession(context.Background(), agentDir, saved)
+	if err != nil {
+		t.Fatalf("EstablishSession failed: %v", err)
+	}
+	if sessionID != "fresh-session-after-mismatch" {
+		t.Errorf("expected fresh-session-after-mismatch, got: %s", sessionID)
+	}
+
+	_ = inWriter.Close()
+	_ = outWriter.Close()
 }
 
 func TestClient_Prompt_EmitUsage(t *testing.T) {

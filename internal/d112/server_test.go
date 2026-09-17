@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/colinrgodsey/wackyacp/internal/acp"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
@@ -17,13 +18,22 @@ import (
 )
 
 type mockACPDriver struct {
-	chunks   []string
-	warnings []string
-	usage    acp.UsageMetrics
-	err      error
+	chunks            []string
+	warnings          []string
+	usage             acp.UsageMetrics
+	err               error
+	promptHook        func(ctx context.Context)
+	cancelCh          chan string
+	canceledSessionID string
 }
 
 func (m *mockACPDriver) Prompt(ctx context.Context, sessionID, promptText string, callbacks acp.TurnCallbacks) (*acp.PromptResult, error) {
+	if m.promptHook != nil {
+		m.promptHook(ctx)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -44,6 +54,10 @@ func (m *mockACPDriver) Prompt(ctx context.Context, sessionID, promptText string
 }
 
 func (m *mockACPDriver) Cancel(sessionID string) error {
+	m.canceledSessionID = sessionID
+	if m.cancelCh != nil {
+		m.cancelCh <- sessionID
+	}
 	return nil
 }
 
@@ -213,5 +227,42 @@ func TestD112_ErrorMapping(t *testing.T) {
 	})
 	if status.Code(err) != codes.Internal {
 		t.Errorf("expected codes.Internal for ACP turn error, got: %v", err)
+	}
+}
+
+func TestD112_StreamCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelCh := make(chan string, 1)
+	driver := &mockACPDriver{
+		cancelCh: cancelCh,
+		promptHook: func(promptCtx context.Context) {
+			cancel()
+			<-promptCtx.Done()
+		},
+	}
+
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	stream, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "agent-test",
+		UserMessage: "hello",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	_, err = stream.Recv()
+	if status.Code(err) != codes.Canceled {
+		t.Errorf("expected codes.Canceled, got: %v", err)
+	}
+
+	select {
+	case sid := <-cancelCh:
+		if sid != "test-session-123" {
+			t.Errorf("expected driver.Cancel to be called with test-session-123, got: %q", sid)
+		}
+	case <-time.After(1 * time.Second):
+		t.Errorf("timed out waiting for driver.Cancel to be called")
 	}
 }

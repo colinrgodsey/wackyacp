@@ -415,3 +415,53 @@ func TestE2E_LockDiscipline_SerializesTurns(t *testing.T) {
 		t.Fatalf("timed out waiting for wackyacp to acquire lock and exit")
 	}
 }
+
+func TestE2E_HarnessIgnoreEOF_ExitsWithinWaitDelay(t *testing.T) {
+	agentFolder := t.TempDir()
+	ctx := context.Background()
+
+	// Spawn wackyacp with harness script ignore-eof (which simulates a harness that doesn't exit on stdin EOF)
+	client, cleanup := spawnBridge(t, ctx, agentFolder, "ignore-eof")
+
+	// Execute a normal turn over D112 to ensure the bridge and harness are fully operational
+	stream, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "hello ignore eof",
+	})
+	if err != nil {
+		cleanup()
+		t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	for {
+		_, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			cleanup()
+			t.Fatalf("unexpected stream error: %v", err)
+		}
+	}
+
+	// Normal turn completed. Now close client connection (closing stdin to wackyacp).
+	// wackyacp should terminate the uncooperative harness and exit within WaitDelay bounds.
+	cleanupStart := time.Now()
+	done := make(chan struct{})
+	go func() {
+		cleanup()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		elapsed := time.Since(cleanupStart)
+		t.Logf("wackyacp exited in %v with uncooperative harness", elapsed)
+		// WaitDelay is 5s; with SIGTERM escalation it exits within ~100ms. Bound check at 6s.
+		if elapsed > 6*time.Second {
+			t.Errorf("cleanup took %v, exceeded WaitDelay bound", elapsed)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("wackyacp failed to exit within WaitDelay bounds when harness ignored EOF")
+	}
+}
