@@ -17,7 +17,7 @@ import (
 // defaultOptions mirrors what parseFlags yields with no arguments, so buildConfig
 // tests exercise the real validation instead of placeholder zero values.
 func defaultOptions() options {
-	return options{pollInterval: 100 * time.Millisecond, printTimeout: "20m"}
+	return options{pollInterval: 100 * time.Millisecond, printTimeout: "20m", permissionMode: "deny"}
 }
 
 // executableFile writes an executable stand-in for the agent binary.
@@ -44,6 +44,10 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if opts.printTimeout != "20m" {
 		t.Fatalf("printTimeout = %q, want 20m", opts.printTimeout)
 	}
+
+	if opts.permissionMode != "deny" {
+		t.Fatalf("permissionMode = %q, want deny", opts.permissionMode)
+	}
 	if opts.conversationsDir != "" || opts.stateDir != "" || opts.logDir != "" {
 		t.Fatal("directory flags must stay empty so defaults apply")
 	}
@@ -60,6 +64,7 @@ func TestParseFlagsOverrides(t *testing.T) {
 		"--print-timeout", "5m",
 		"--poll-interval", "25ms",
 		"--show-narration",
+		"--permission-mode", "approve",
 	}, io.Discard)
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
@@ -82,6 +87,10 @@ func TestParseFlagsOverrides(t *testing.T) {
 	}
 	if cfg.PrintTimeout != "5m" || cfg.PollInterval != 25*time.Millisecond || !cfg.ShowNarration {
 		t.Fatalf("cfg = %+v", cfg)
+	}
+
+	if cfg.PermissionMode != "approve" {
+		t.Fatalf("PermissionMode = %q, want approve", cfg.PermissionMode)
 	}
 }
 
@@ -163,7 +172,7 @@ func TestBuildConfigAgyBinMustBeExecutable(t *testing.T) {
 	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := buildConfig(options{agyBin: executable, pollInterval: 100 * time.Millisecond, printTimeout: "20m"}, io.Discard)
+	cfg, err := buildConfig(options{agyBin: executable, pollInterval: 100 * time.Millisecond, printTimeout: "20m", permissionMode: "deny"}, io.Discard)
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
@@ -233,7 +242,7 @@ func TestBuildConfigDefaultsAndWorkingDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := buildConfig(options{agyBin: agy, workDir: workDir, pollInterval: 100 * time.Millisecond, printTimeout: "20m"}, io.Discard)
+	cfg, err := buildConfig(options{agyBin: agy, workDir: workDir, pollInterval: 100 * time.Millisecond, printTimeout: "20m", permissionMode: "deny"}, io.Discard)
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
@@ -258,7 +267,7 @@ func TestBuildConfigDefaultsAndWorkingDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fromCwd, err := buildConfig(options{agyBin: agy, pollInterval: 100 * time.Millisecond, printTimeout: "20m"}, io.Discard)
+	fromCwd, err := buildConfig(options{agyBin: agy, pollInterval: 100 * time.Millisecond, printTimeout: "20m", permissionMode: "deny"}, io.Discard)
 	if err != nil {
 		t.Fatalf("buildConfig with cwd: %v", err)
 	}
@@ -460,4 +469,41 @@ func buildAgyStub(t *testing.T) string {
 		t.Fatalf("building the agy stub: %v: %s", err, output)
 	}
 	return out
+}
+
+// TestBuildConfigRejectsUnknownPermissionMode keeps the posture closed: only deny and
+// approve are understood, so a typo cannot silently mean something other than what the
+// operator wrote.
+func TestBuildConfigRejectsUnknownPermissionMode(t *testing.T) {
+	dir := t.TempDir()
+	agyBin := filepath.Join(dir, "agy")
+	if err := os.WriteFile(agyBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mode := range []string{"yolo", "Approve", ""} {
+		opts := defaultOptions()
+		opts.agyBin = agyBin
+		opts.permissionMode = mode
+		_, err := buildConfig(opts, io.Discard)
+		if err == nil {
+			t.Fatalf("--permission-mode %q was accepted", mode)
+		}
+		if !strings.Contains(err.Error(), "--permission-mode") {
+			t.Fatalf("error = %v, want it to name --permission-mode", err)
+		}
+	}
+
+	for _, mode := range []string{"deny", "approve"} {
+		opts := defaultOptions()
+		opts.agyBin = agyBin
+		opts.permissionMode = mode
+		cfg, err := buildConfig(opts, io.Discard)
+		if err != nil {
+			t.Fatalf("--permission-mode %s: %v", mode, err)
+		}
+		if cfg.PermissionMode != mode {
+			t.Fatalf("PermissionMode = %q, want %q", cfg.PermissionMode, mode)
+		}
+	}
 }

@@ -20,6 +20,20 @@ import (
 	"time"
 )
 
+// Permission postures accepted by Config.PermissionMode. They mirror wackyacp's own
+// --permission-mode flag so an operator uses one vocabulary across both bridges.
+// Approve has to be an agy command line flag rather than an ACP exchange: headless
+// agy answers its own permission requests, denying them before anything can reach
+// the bridge to ask.
+const (
+	// PermissionDeny leaves agy's command line untouched, so agy keeps its own
+	// posture of denying tool requests it has no settings rule for.
+	PermissionDeny = "deny"
+	// PermissionApprove appends agy's auto-approve flag, so agy runs tool calls
+	// instead of denying them.
+	PermissionApprove = "approve"
+)
+
 // Config configures a Bridge. Every filesystem location is injectable so the
 // bridge can be pointed at a fixture instead of a real agy install.
 type Config struct {
@@ -44,6 +58,10 @@ type Config struct {
 	// ShowNarration keeps agy's internal "I will ..." planning lines in the
 	// output instead of dropping them.
 	ShowNarration bool
+	// PermissionMode is the tool-permission posture: PermissionDeny or
+	// PermissionApprove. The zero value behaves as deny; cmd/wackyagy rejects
+	// anything outside the two.
+	PermissionMode string
 	// Version is reported in agentInfo.
 	Version string
 	// Stderr receives diagnostics. Protocol messages never use it.
