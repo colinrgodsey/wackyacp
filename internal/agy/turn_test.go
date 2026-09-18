@@ -585,3 +585,61 @@ func TestRunTurnCancelBeforeSpawnSkipsStarter(t *testing.T) {
 		t.Fatalf("starter invoked %d times for a turn cancelled before spawn, want 0", spawnCount)
 	}
 }
+
+// TestPermissionModeApproveReachesTheAgentCommandLine is the wiring guard: the flag
+// has to arrive at the child, not merely sit in the Config.
+func TestPermissionModeApproveReachesTheAgentCommandLine(t *testing.T) {
+	env := newTestEnv(t)
+	runner := &scriptRunner{}
+	runner.add(func(context.Context, []string) error { return nil })
+	h := newHarness(t)
+
+	cfg := env.config()
+	cfg.PermissionMode = PermissionApprove
+	h.serve(NewBridgeWithStarter(cfg, runner.starter()))
+
+	sessionID := newSession(t, h)
+	mustOK(t, h.responseFor(promptID(h, sessionID, "run something")))
+
+	argv := strings.Join(runner.argvAt(t, 0), " ")
+	if strings.Count(argv, skipPermissionsFlag) != 1 {
+		t.Fatalf("argv = %s, want exactly one %s", argv, skipPermissionsFlag)
+	}
+}
+
+// TestWithPermissionModeOnlyAppendsInApprovePosture covers the postures the harness
+// cannot: the zero value and deny must leave the command line untouched, and an
+// operator who already passed the flag through --extra-args must not get a second.
+func TestWithPermissionModeOnlyAppendsInApprovePosture(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		mode string
+		want []string
+	}{
+		{"deny leaves agy alone", []string{"agy", "-p", "hi"}, PermissionDeny, []string{"agy", "-p", "hi"}},
+		{"unset leaves agy alone", []string{"agy", "-p", "hi"}, "", []string{"agy", "-p", "hi"}},
+		{"bogus leaves agy alone", []string{"agy"}, "yolo", []string{"agy"}},
+		{"approve appends", []string{"agy"}, PermissionApprove, []string{"agy", skipPermissionsFlag}},
+		{
+			"approve does not repeat an explicit flag",
+			[]string{"agy", skipPermissionsFlag}, PermissionApprove, []string{"agy", skipPermissionsFlag},
+		},
+		{
+			"an explicit value counts as present",
+			[]string{"agy", skipPermissionsFlag + "=false"}, PermissionApprove, []string{"agy", skipPermissionsFlag + "=false"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			before := strings.Join(tc.args, "|")
+			got := withPermissionMode(tc.args, tc.mode)
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("withPermissionMode(%v, %q) = %v, want %v", tc.args, tc.mode, got, tc.want)
+			}
+			if strings.Join(tc.args, "|") != before {
+				t.Fatalf("the caller's slice was modified in place: %v", tc.args)
+			}
+		})
+	}
+}

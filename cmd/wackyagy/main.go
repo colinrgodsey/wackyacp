@@ -41,6 +41,7 @@ type options struct {
 	printTimeout     string
 	pollInterval     time.Duration
 	showNarration    bool
+	permissionMode   string
 }
 
 func main() {
@@ -84,6 +85,7 @@ func parseFlags(args []string, stderr io.Writer) (opts options, showVersion bool
 	flags.StringVar(&opts.printTimeout, "print-timeout", "20m", "agy --print-timeout value")
 	flags.DurationVar(&opts.pollInterval, "poll-interval", 100*time.Millisecond, "how often to re-read the conversation database")
 	flags.BoolVar(&opts.showNarration, "show-narration", envFlag("AGY_SHOW_NARRATION"), "keep agy's leading \"I will ...\" planning lines in the output (env AGY_SHOW_NARRATION)")
+	flags.StringVar(&opts.permissionMode, "permission-mode", "deny", "How tool permission requests are handled: deny (agy default, which headless agy satisfies by denying) or approve (pass agy --dangerously-skip-permissions)")
 	flags.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	if err := flags.Parse(args); err != nil {
@@ -137,6 +139,12 @@ func buildConfig(opts options, stderr io.Writer) (agy.Config, error) {
 		return agy.Config{}, fmt.Errorf("--print-timeout must not be empty")
 	}
 
+	switch opts.permissionMode {
+	case agy.PermissionDeny, agy.PermissionApprove:
+	default:
+		return agy.Config{}, fmt.Errorf("--permission-mode must be %q or %q, got %q", agy.PermissionDeny, agy.PermissionApprove, opts.permissionMode)
+	}
+
 	var extraArgs []string
 	if strings.TrimSpace(opts.extraArgs) != "" {
 		parsed, err := shlex.Split(opts.extraArgs, true)
@@ -156,6 +164,7 @@ func buildConfig(opts options, stderr io.Writer) (agy.Config, error) {
 		PrintTimeout:     opts.printTimeout,
 		PollInterval:     opts.pollInterval,
 		ShowNarration:    opts.showNarration,
+		PermissionMode:   opts.permissionMode,
 		Version:          version,
 		Stderr:           stderr,
 	}, nil

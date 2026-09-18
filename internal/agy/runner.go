@@ -175,6 +175,7 @@ func (t *tailBuffer) String() string {
 func (b *Bridge) agentArgs(sess StoredSession, promptText string) []string {
 	args := []string{b.cfg.AgyBin, "--add-dir", b.cfg.WorkingDir}
 	args = append(args, withPrintTimeout(b.cfg.ExtraArgs, b.cfg.PrintTimeout)...)
+	args = withPermissionMode(args, b.cfg.PermissionMode)
 	if sess.ConversationID != "" {
 		args = append(args, "--conversation", sess.ConversationID)
 	}
@@ -182,6 +183,28 @@ func (b *Bridge) agentArgs(sess StoredSession, promptText string) []string {
 		args = append(args, "--model", model)
 	}
 	return append(args, "-p", promptText)
+}
+
+// skipPermissionsFlag is agy's own auto-approve switch, and the only way to get
+// approve posture: headless agy answers tool permission requests itself, denying
+// them, so the bridge can never see one to forward.
+const skipPermissionsFlag = "--dangerously-skip-permissions"
+
+// withPermissionMode appends agy's auto-approve flag in approve posture, unless the
+// operator already passed it through --extra-args. Deny posture appends nothing, so
+// agy keeps its own default posture.
+func withPermissionMode(args []string, mode string) []string {
+	if mode != PermissionApprove {
+		return args
+	}
+	for _, arg := range args {
+		if arg == skipPermissionsFlag || strings.HasPrefix(arg, skipPermissionsFlag+"=") {
+			return args
+		}
+	}
+	out := make([]string, 0, len(args)+1)
+	out = append(out, args...)
+	return append(out, skipPermissionsFlag)
 }
 
 // withPrintTimeout appends the default print timeout unless the caller already
