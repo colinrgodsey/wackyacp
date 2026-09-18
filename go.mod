@@ -2,12 +2,11 @@ module github.com/colinrgodsey/wackyacp
 
 go 1.25.7
 
-replace github.com/colinrgodsey/wackypub => /home/moltbot/workspace/projects/wackypub
-
 require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be
-	github.com/colinrgodsey/wackypub v0.0.0-00010101000000-000000000000
+	github.com/colinrgodsey/wackypub v0.0.0-20260917222125-ef686252bf41
 	google.golang.org/grpc v1.83.2
+	modernc.org/sqlite v1.50.1
 )
 
 require (
@@ -24,5 +23,4 @@ require (
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.50.1 // indirect
 )
