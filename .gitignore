@@ -2,3 +2,5 @@
 /wackyacp
 /acpshimbin
 *.lock
+go.work
+go.work.sum
