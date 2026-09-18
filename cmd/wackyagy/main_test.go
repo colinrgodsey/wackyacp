@@ -121,8 +121,14 @@ func TestUnbalancedExtraArgsFails(t *testing.T) {
 }
 
 func TestBuildConfigRequiresAbsoluteDirectories(t *testing.T) {
+	// An agent binary has to exist, or buildConfig fails on resolving it before it
+	// ever looks at the directories, and the test passes for the wrong reason on a
+	// host with agy installed while failing on one without.
+	agyBin := executableFile(t, t.TempDir(), "agy")
+
 	for _, flagName := range []string{"--workdir", "--conversations-dir", "--state-dir", "--log-dir"} {
 		opts := defaultOptions()
+		opts.agyBin = agyBin
 		switch flagName {
 		case "--workdir":
 			opts.workDir = "relative/path"
@@ -149,7 +155,7 @@ func TestBuildConfigRejectsFileInPlaceOfDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := buildConfig(options{stateDir: file, pollInterval: 100 * time.Millisecond, printTimeout: "20m"}, io.Discard)
+	_, err := buildConfig(options{agyBin: executableFile(t, t.TempDir(), "agy"), stateDir: file, pollInterval: 100 * time.Millisecond, printTimeout: "20m", permissionMode: "deny"}, io.Discard)
 	if err == nil {
 		t.Fatal("a regular file was accepted as --state-dir")
 	}
