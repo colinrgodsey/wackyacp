@@ -20,6 +20,7 @@ func run() error {
 	harnessCmd := flag.String("harness-cmd", "", "Harness command to execute (e.g. agy, npx)")
 	harnessArgs := flag.String("harness-args", "", "Arguments for the harness command")
 	agentFolder := flag.String("agent-folder", "", "Absolute path to the agent folder")
+	permissionMode := flag.String("permission-mode", "deny", "How to answer session/request_permission from the harness: deny (D117 default, auto-deny) or approve (auto-approve; trusted local harnesses only)")
 	flag.Parse()
 
 	// 1. Validate agent-folder: must be absolute, NO CWD-based fallback (D117 Decision)
@@ -84,6 +85,7 @@ func run() error {
 
 	// 7. Initialize ACP client and perform handshake
 	acpClient := acp.NewClient(proc.Stdin, proc.Stdout)
+	acpClient.PermissionMode = *permissionMode
 	if _, err := acpClient.Initialize(ctx); err != nil {
 		return fmt.Errorf("acp initialize failed: %w", err)
 	}
