@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/colinrgodsey/wackyacp/internal/harness"
 	"github.com/colinrgodsey/wackyacp/internal/session"
@@ -315,5 +316,483 @@ func TestClient_Prompt_AutoDenyPermission(t *testing.T) {
 	}
 	if !foundOutcomeChunk {
 		t.Errorf("expected outcome chunk from shim, got: %v", chunks)
+	}
+}
+
+type pipeMockHarness struct {
+	t        *testing.T
+	inWriter *io.PipeWriter
+	scanner  *bufio.Scanner
+}
+
+func newPipeMockHarness(t *testing.T) (*Client, *pipeMockHarness, func()) {
+	inReader, inWriter := io.Pipe()
+	outReader, outWriter := io.Pipe()
+
+	client := NewClient(outWriter, inReader)
+	scanner := bufio.NewScanner(outReader)
+
+	h := &pipeMockHarness{
+		t:        t,
+		inWriter: inWriter,
+		scanner:  scanner,
+	}
+
+	cleanup := func() {
+		_ = inWriter.Close()
+		_ = outWriter.Close()
+	}
+
+	return client, h, cleanup
+}
+
+func (h *pipeMockHarness) readRequest() (map[string]any, int64) {
+	if !h.scanner.Scan() {
+		h.t.Fatalf("expected request, got scanner error: %v", h.scanner.Err())
+	}
+	var req map[string]any
+	if err := json.Unmarshal(h.scanner.Bytes(), &req); err != nil {
+		h.t.Fatalf("unmarshaling request: %v", err)
+	}
+	var id int64
+	switch v := req["id"].(type) {
+	case float64:
+		id = int64(v)
+	case int64:
+		id = v
+	}
+	return req, id
+}
+
+func (h *pipeMockHarness) sendChunk(sessionID, text string) {
+	h.sendUpdate(sessionID, map[string]any{
+		"sessionUpdate": "agent_message_chunk",
+		"content": map[string]any{
+			"type": "text",
+			"text": text,
+		},
+	})
+}
+
+func (h *pipeMockHarness) sendUpdate(sessionID string, update map[string]any) {
+	notif := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": sessionID,
+			"update":    update,
+		},
+	}
+	data, err := json.Marshal(notif)
+	if err != nil {
+		h.t.Fatalf("marshaling notif: %v", err)
+	}
+	_, _ = fmt.Fprintf(h.inWriter, "%s\n", data)
+}
+
+func (h *pipeMockHarness) sendPromptResponse(id int64, stopReason string) {
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result": map[string]any{
+			"stopReason": stopReason,
+		},
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		h.t.Fatalf("marshaling response: %v", err)
+	}
+	_, _ = fmt.Fprintf(h.inWriter, "%s\n", data)
+}
+
+func TestClient_Coalesce_DeltaFragmentsJoinContiguously(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var (
+		chunksMu sync.Mutex
+		chunks   []string
+	)
+	callbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunksMu.Lock()
+			chunks = append(chunks, text)
+			chunksMu.Unlock()
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, id := harness.readRequest()
+		harness.sendChunk("sess-1", "Hello, ")
+		harness.sendChunk("sess-1", "world")
+		harness.sendChunk("sess-1", "!")
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	res, err := client.Prompt(context.Background(), "sess-1", "hi", callbacks)
+	if err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	if res.StopReason != "end_turn" {
+		t.Errorf("expected end_turn, got %s", res.StopReason)
+	}
+	<-done
+
+	chunksMu.Lock()
+	defer chunksMu.Unlock()
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 coalesced chunk, got %d: %v", len(chunks), chunks)
+	}
+	if chunks[0] != "Hello, world!" {
+		t.Errorf("expected 'Hello, world!', got %q", chunks[0])
+	}
+}
+
+func TestClient_Coalesce_BoundaryFlushOnToolCall(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var (
+		chunksMu sync.Mutex
+		chunks   []string
+	)
+	callbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunksMu.Lock()
+			chunks = append(chunks, text)
+			chunksMu.Unlock()
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, id := harness.readRequest()
+		// First logical message part
+		harness.sendChunk("sess-1", "I will check ")
+		harness.sendChunk("sess-1", "the file.")
+		// Boundary 1: tool_call arrives
+		harness.sendUpdate("sess-1", map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "call-1",
+			"title":         "read_file",
+		})
+		// Boundary 2: tool_call_update arrives
+		harness.sendUpdate("sess-1", map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "call-1",
+			"status":        "completed",
+		})
+		// Second logical message part
+		harness.sendChunk("sess-1", "The file has ")
+		harness.sendChunk("sess-1", "3 lines.")
+		// Boundary 3: usage_update arrives
+		harness.sendUpdate("sess-1", map[string]any{
+			"sessionUpdate": "usage_update",
+			"used":          42,
+		})
+		// Third logical message part
+		harness.sendChunk("sess-1", "All done.")
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	res, err := client.Prompt(context.Background(), "sess-1", "do work", callbacks)
+	if err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	if res.StopReason != "end_turn" {
+		t.Errorf("expected end_turn, got %s", res.StopReason)
+	}
+	<-done
+
+	chunksMu.Lock()
+	defer chunksMu.Unlock()
+	want := []string{
+		"I will check the file.",
+		"The file has 3 lines.",
+		"All done.",
+	}
+	if len(chunks) != len(want) {
+		t.Fatalf("expected %d chunks, got %d: %v", len(want), len(chunks), chunks)
+	}
+	for i := range want {
+		if chunks[i] != want[i] {
+			t.Errorf("chunk %d: expected %q, got %q", i, want[i], chunks[i])
+		}
+	}
+}
+
+func TestClient_Coalesce_BoundaryFlushAtTurnEnd(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var (
+		chunksMu sync.Mutex
+		chunks   []string
+	)
+	callbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunksMu.Lock()
+			chunks = append(chunks, text)
+			chunksMu.Unlock()
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, id := harness.readRequest()
+		harness.sendChunk("sess-1", "Single part across ")
+		harness.sendChunk("sess-1", "multiple streaming deltas.")
+		// No tool call or usage update - turn end should flush the buffer
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	res, err := client.Prompt(context.Background(), "sess-1", "tell me", callbacks)
+	if err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	if res.StopReason != "end_turn" {
+		t.Errorf("expected end_turn, got %s", res.StopReason)
+	}
+	<-done
+
+	chunksMu.Lock()
+	defer chunksMu.Unlock()
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk at turn end, got %d: %v", len(chunks), chunks)
+	}
+	want := "Single part across multiple streaming deltas."
+	if chunks[0] != want {
+		t.Errorf("expected %q, got %q", want, chunks[0])
+	}
+}
+
+func TestClient_Coalesce_PerTurnResetNoBleed(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	// Turn 1
+	var (
+		chunks1Mu sync.Mutex
+		chunks1   []string
+	)
+	callbacks1 := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunks1Mu.Lock()
+			chunks1 = append(chunks1, text)
+			chunks1Mu.Unlock()
+			return nil
+		},
+	}
+
+	done1 := make(chan struct{})
+	go func() {
+		defer close(done1)
+		_, id := harness.readRequest()
+		harness.sendChunk("sess-1", "Turn 1 fragment A, ")
+		harness.sendChunk("sess-1", "Turn 1 fragment B.")
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	_, err := client.Prompt(context.Background(), "sess-1", "turn 1", callbacks1)
+	if err != nil {
+		t.Fatalf("Turn 1 failed: %v", err)
+	}
+	<-done1
+
+	chunks1Mu.Lock()
+	if len(chunks1) != 1 || chunks1[0] != "Turn 1 fragment A, Turn 1 fragment B." {
+		t.Fatalf("Turn 1 unexpected chunks: %v", chunks1)
+	}
+	chunks1Mu.Unlock()
+
+	// Turn 2 on the same client and session
+	var (
+		chunks2Mu sync.Mutex
+		chunks2   []string
+	)
+	callbacks2 := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunks2Mu.Lock()
+			chunks2 = append(chunks2, text)
+			chunks2Mu.Unlock()
+			return nil
+		},
+	}
+
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		_, id := harness.readRequest()
+		harness.sendChunk("sess-1", "Turn 2 fresh text.")
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	_, err = client.Prompt(context.Background(), "sess-1", "turn 2", callbacks2)
+	if err != nil {
+		t.Fatalf("Turn 2 failed: %v", err)
+	}
+	<-done2
+
+	chunks2Mu.Lock()
+	defer chunks2Mu.Unlock()
+	if len(chunks2) != 1 {
+		t.Fatalf("expected 1 chunk for Turn 2, got %d: %v", len(chunks2), chunks2)
+	}
+	if chunks2[0] != "Turn 2 fresh text." {
+		t.Errorf("expected 'Turn 2 fresh text.', got %q (buffer bled from Turn 1)", chunks2[0])
+	}
+}
+
+func TestClient_Coalesce_EmptyDeltaSafety(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var (
+		chunksMu sync.Mutex
+		chunks   []string
+	)
+	callbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunksMu.Lock()
+			chunks = append(chunks, text)
+			chunksMu.Unlock()
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, id := harness.readRequest()
+		// Interleave empty deltas
+		harness.sendChunk("sess-1", "")
+		harness.sendChunk("sess-1", "alpha")
+		harness.sendChunk("sess-1", "")
+		harness.sendChunk("sess-1", " ")
+		harness.sendChunk("sess-1", "")
+		harness.sendChunk("sess-1", "beta")
+		harness.sendChunk("sess-1", "")
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	res, err := client.Prompt(context.Background(), "sess-1", "empty test", callbacks)
+	if err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	if res.StopReason != "end_turn" {
+		t.Errorf("expected end_turn, got %s", res.StopReason)
+	}
+	<-done
+
+	chunksMu.Lock()
+	defer chunksMu.Unlock()
+	if len(chunks) != 1 {
+		t.Fatalf("expected 1 chunk, got %d: %v", len(chunks), chunks)
+	}
+	if chunks[0] != "alpha beta" {
+		t.Errorf("expected 'alpha beta', got %q", chunks[0])
+	}
+
+	// Also verify that a turn with ONLY empty deltas emits zero chunks
+	var emptyTurnChunks []string
+	emptyCallbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			emptyTurnChunks = append(emptyTurnChunks, text)
+			return nil
+		},
+	}
+
+	doneEmpty := make(chan struct{})
+	go func() {
+		defer close(doneEmpty)
+		_, id := harness.readRequest()
+		harness.sendChunk("sess-1", "")
+		harness.sendChunk("sess-1", "")
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	_, err = client.Prompt(context.Background(), "sess-1", "all empty", emptyCallbacks)
+	if err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	<-doneEmpty
+
+	if len(emptyTurnChunks) != 0 {
+		t.Errorf("expected 0 chunks for all-empty turn, got %d: %v", len(emptyTurnChunks), emptyTurnChunks)
+	}
+}
+
+func TestClient_Coalesce_CancelSafety(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var (
+		chunksMu sync.Mutex
+		chunks   []string
+	)
+	callbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			chunksMu.Lock()
+			chunks = append(chunks, text)
+			chunksMu.Unlock()
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	reqReceived := make(chan struct{})
+	trailingDone := make(chan struct{})
+	promptDone := make(chan error, 1)
+
+	go func() {
+		_, _ = harness.readRequest()
+		close(reqReceived)
+
+		// Send delta before cancel
+		harness.sendChunk("sess-cancel", "pre-cancel text")
+
+		// Wait until cancel is triggered by main goroutine
+		<-ctx.Done()
+
+		// Send trailing notifications after cancel has occurred
+		harness.sendChunk("sess-cancel", "trailing chunk after cancel")
+		harness.sendUpdate("sess-cancel", map[string]any{
+			"sessionUpdate": "tool_call",
+			"title":         "trailing_tool",
+		})
+		close(trailingDone)
+	}()
+
+	go func() {
+		_, err := client.Prompt(ctx, "sess-cancel", "cancel me", callbacks)
+		promptDone <- err
+	}()
+
+	<-reqReceived
+	// Give harness goroutine a moment to send the pre-cancel chunk
+	time.Sleep(10 * time.Millisecond)
+
+	cancel()
+
+	err := <-promptDone
+	if err == nil {
+		t.Fatalf("expected error on cancelled Prompt, got nil")
+	}
+	<-trailingDone
+
+	// Verify pre-cancel text was flushed cleanly and no data race occurred
+	chunksMu.Lock()
+	defer chunksMu.Unlock()
+	for _, c := range chunks {
+		if c == "" {
+			t.Errorf("unexpected empty chunk emitted")
+		}
 	}
 }

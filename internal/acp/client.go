@@ -32,6 +32,55 @@ type activeTurn struct {
 	callbacks TurnCallbacks
 	usage     UsageMetrics
 	mu        sync.Mutex
+	textBuf   strings.Builder
+	closed    bool
+	chunkMu   sync.Mutex
+}
+
+func (t *activeTurn) appendText(text string) {
+	if text == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	t.textBuf.WriteString(text)
+}
+
+func (t *activeTurn) flushInternal(closeTurn bool) error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	if closeTurn {
+		t.closed = true
+	}
+	if t.textBuf.Len() == 0 {
+		t.mu.Unlock()
+		return nil
+	}
+	text := t.textBuf.String()
+	t.textBuf.Reset()
+	onChunk := t.callbacks.OnChunk
+	t.mu.Unlock()
+
+	if onChunk != nil && text != "" {
+		t.chunkMu.Lock()
+		defer t.chunkMu.Unlock()
+		return onChunk(text)
+	}
+	return nil
+}
+
+func (t *activeTurn) flush() error {
+	return t.flushInternal(false)
+}
+
+func (t *activeTurn) closeAndFlush() error {
+	return t.flushInternal(true)
 }
 
 // Client implements a bidirectional ACP JSON-RPC client over stdio.
@@ -169,6 +218,13 @@ func (c *Client) handleIncomingRequest(line []byte) {
 
 	switch req.Method {
 	case "session/request_permission":
+		c.activeTurnMu.RLock()
+		turn := c.activeTurn
+		c.activeTurnMu.RUnlock()
+		if turn != nil {
+			_ = turn.flush()
+		}
+
 		var params PermissionRequestParams
 		raw, _ := json.Marshal(req.Params)
 		_ = json.Unmarshal(raw, &params)
@@ -192,7 +248,7 @@ func (c *Client) handleIncomingRequest(line []byte) {
 			_ = c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil)
 
 			c.activeTurnMu.RLock()
-			turn := c.activeTurn
+			turn = c.activeTurn
 			c.activeTurnMu.RUnlock()
 			if turn != nil && turn.callbacks.OnWarning != nil {
 				_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", params.ToolCall.Title))
@@ -228,7 +284,7 @@ func (c *Client) handleIncomingRequest(line []byte) {
 
 		// Surface warning over D112
 		c.activeTurnMu.RLock()
-		turn := c.activeTurn
+		turn = c.activeTurn
 		c.activeTurnMu.RUnlock()
 
 		if turn != nil && turn.callbacks.OnWarning != nil {
@@ -258,8 +314,11 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		c.activeTurnMu.RLock()
 		turn := c.activeTurn
 		c.activeTurnMu.RUnlock()
-		if turn != nil && turn.callbacks.OnWarning != nil {
-			_ = turn.callbacks.OnWarning("unmapped acp notification: " + notif.Method)
+		if turn != nil {
+			_ = turn.flush()
+			if turn.callbacks.OnWarning != nil {
+				_ = turn.callbacks.OnWarning("unmapped acp notification: " + notif.Method)
+			}
 		}
 		return
 	}
@@ -279,6 +338,9 @@ func (c *Client) handleIncomingNotification(line []byte) {
 	if turn == nil {
 		return
 	}
+	if params.SessionID != "" && turn.sessionID != "" && turn.sessionID != params.SessionID {
+		return
+	}
 
 	var update struct {
 		SessionUpdate string          `json:"sessionUpdate"`
@@ -290,6 +352,10 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		return
 	}
 
+	if update.SessionUpdate != "agent_message_chunk" {
+		_ = turn.flush()
+	}
+
 	switch update.SessionUpdate {
 	case "agent_message_chunk":
 		var content struct {
@@ -297,9 +363,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 			Text string `json:"text"`
 		}
 		if err := json.Unmarshal(update.Content, &content); err == nil && content.Text != "" {
-			if turn.callbacks.OnChunk != nil {
-				_ = turn.callbacks.OnChunk(content.Text)
-			}
+			turn.appendText(content.Text)
 		}
 
 	case "usage_update":
@@ -585,6 +649,7 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 	c.activeTurnMu.Unlock()
 
 	defer func() {
+		_ = turn.closeAndFlush()
 		c.activeTurnMu.Lock()
 		c.activeTurn = nil
 		c.activeTurnMu.Unlock()
@@ -617,8 +682,6 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 	_ = json.Unmarshal(resp.Result, &promptResp)
 
 	turn.mu.Lock()
-	defer turn.mu.Unlock()
-
 	if promptResp.Usage != nil {
 		turn.usage.PromptTokens = promptResp.Usage.InputTokens
 		turn.usage.CompletionTokens = promptResp.Usage.OutputTokens
@@ -627,10 +690,14 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 		// When usage came via usage_update
 		turn.usage.PromptTokens = turn.usage.TotalTokens
 	}
+	usage := turn.usage
+	turn.mu.Unlock()
+
+	_ = turn.closeAndFlush()
 
 	return &PromptResult{
 		StopReason: promptResp.StopReason,
-		Usage:      turn.usage,
+		Usage:      usage,
 	}, nil
 }
 
