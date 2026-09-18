@@ -542,3 +542,46 @@ func TestConcurrentSessionsDoNotInterleaveWrites(t *testing.T) {
 		}
 	}
 }
+
+// TestRunTurnCancelBeforeSpawnSkipsStarter is the regression guard for the cancel/spawn
+// race: if session/cancel lands between turn registration and the starter being reached,
+// runTurn must not fork agy just to SIGTERM it. A pre-cancelled child context means the
+// starter must never be invoked and the outcome reports cancellation.
+func TestRunTurnCancelBeforeSpawnSkipsStarter(t *testing.T) {
+	env := newTestEnv(t)
+
+	var mu sync.Mutex
+	spawnCount := 0
+	starter := func(ctx context.Context, argv []string) (agentProcess, error) {
+		mu.Lock()
+		spawnCount++
+		mu.Unlock()
+		fatal := func(context.Context, []string) error { return nil }
+		return &scriptedAgent{ctx: ctx, argv: argv, script: fatal}, nil
+	}
+
+	b := NewBridgeWithStarter(env.config(), starter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel lands before the turn goroutine ever reaches the spawn
+
+	turn, ok := b.registerTurn("sess-cancel-before-spawn", cancel)
+	if !ok {
+		t.Fatal("registerTurn failed")
+	}
+
+	sess := StoredSession{ConversationID: "convo-existing", LastStepIdx: 0}
+	outcome, err := b.runTurn(ctx, turn, "prompt", sess, func(Update) error { return nil })
+	if err != nil {
+		t.Fatalf("runTurn returned error for a cancelled-before-spawn turn: %v", err)
+	}
+	if outcome.StopReason != StopReasonCancelled {
+		t.Fatalf("StopReason = %q, want %q", outcome.StopReason, StopReasonCancelled)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if spawnCount != 0 {
+		t.Fatalf("starter invoked %d times for a turn cancelled before spawn, want 0", spawnCount)
+	}
+}

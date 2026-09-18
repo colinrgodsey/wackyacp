@@ -227,6 +227,13 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 	defer cancelChild()
 
 	argv := b.agentArgs(sess, promptText)
+	if childCtx.Err() != nil {
+		// session/cancel landed between turn registration and spawn: exec.CommandContext only
+		// applies Cancel after the child is forked, so spawning anyway would fork agy just to
+		// SIGTERM it. Skip the fork and report the cancellation the turn already carries.
+		outcome.StopReason = StopReasonCancelled
+		return outcome, nil
+	}
 	b.logf("spawning %s", strings.Join(argvForLog(argv), " "))
 	proc, err := b.starter(childCtx, argv)
 	if err != nil {
