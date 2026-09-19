@@ -209,6 +209,19 @@ func (s *Server) AddAndGenerateTurn(ctx context.Context, req *agentv1.AddAndGene
 	}, nil
 }
 
+// AsideQuestion implements agentv1.AgentServiceServer. ACP bridged harnesses (agy via
+// wackyagy, claude via wackyacp) CANNOT support aside with parity: a fresh harness session
+// starts with empty accumulated context - it is NOT a fork of the agent's live session, so
+// an aside would answer without the very context it exists to query. The RPC stays declared
+// in the proto contract so callers get a structured, explicit error (rather than an
+// unknown-method failure) and can decide to fall back to the local agent instead.
+func (s *Server) AsideQuestion(ctx context.Context, req *agentv1.AsideQuestionRequest) (*agentv1.AsideQuestionResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	return nil, status.Errorf(codes.Unimplemented, "aside is not supported over the ACP bridge: bridged harness sessions cannot fork the agent's accumulated context (use the local agent path for aside)")
+}
+
 func (s *Server) ReadSession(ctx context.Context, req *agentv1.ReadSessionRequest) (*agentv1.ReadSessionResponse, error) {
 	return &agentv1.ReadSessionResponse{
 		Turns: []*agentv1.SessionTurn{
