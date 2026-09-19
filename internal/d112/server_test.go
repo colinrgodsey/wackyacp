@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,5 +265,25 @@ func TestD112_StreamCancel(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Errorf("timed out waiting for driver.Cancel to be called")
+	}
+}
+
+// TestD112_AsideQuestion_Unsupported pins Colin's decision: the ACP bridge cannot fork
+// accumulated context, so AsideQuestion responds with codes.Unimplemented and an explicit
+// message - callers get a structured error and can fall back to the local agent path.
+func TestD112_AsideQuestion_Unsupported(t *testing.T) {
+	driver := &mockACPDriver{chunks: []string{"never reached"}}
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	_, err := client.AsideQuestion(context.Background(), &agentv1.AsideQuestionRequest{
+		AgentId:  "agent-test",
+		Question: "what is the state?",
+	})
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("expected codes.Unimplemented for ACP-bridged aside, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "aside") {
+		t.Fatalf("error should mention aside explicitly, got: %v", err)
 	}
 }
