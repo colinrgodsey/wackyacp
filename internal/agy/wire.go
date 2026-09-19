@@ -75,8 +75,11 @@ func newPrefixLogger(w io.Writer, prefix string) func(format string, args ...any
 	if w == nil {
 		w = io.Discard
 	}
+	var mu sync.Mutex
 	return func(format string, args ...any) {
 		message := fmt.Sprintf(format, args...)
+		mu.Lock()
+		defer mu.Unlock()
 		for _, line := range strings.Split(strings.TrimRight(message, "\n"), "\n") {
 			fmt.Fprintf(w, "%s%s\n", prefix, line)
 		}

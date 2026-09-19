@@ -643,3 +643,56 @@ func TestWithPermissionModeOnlyAppendsInApprovePosture(t *testing.T) {
 		})
 	}
 }
+
+func TestPromptAdvisoriesAggregatedAndLoggedToFile(t *testing.T) {
+	env := newTestEnv(t)
+	runner := &scriptRunner{}
+	namelessTool := pbBytes(fieldToolWrapper, pbBytes(fieldToolCall, pbString(fieldToolArgs, "{}")))
+	runner.add(writesConversation(t, env, "conv-advisories", []row{
+		{idx: 1, stepType: stepTypeText, payload: textPayload("Hello")},
+		{idx: 2, stepType: stepTypeText, payload: []byte{0xff, 0xff}},
+		{idx: 3, stepType: 5, payload: namelessTool},
+		{idx: 4, stepType: stepTypeText, payload: textPayload(" world")},
+	}))
+	h := startBridge(t, env, runner)
+	sessionID := newSession(t, h)
+
+	msg := h.responseFor(h.request("session/prompt", map[string]any{
+		"sessionId": sessionID,
+		"prompt":    []map[string]string{{"type": "text", "text": "test"}},
+	}))
+	if got := stopReason(t, msg); got != StopReasonEndTurn {
+		t.Fatalf("stopReason = %q, want end_turn", got)
+	}
+	if got := h.text(); got != "Hello world" {
+		t.Fatalf("streamed text = %q, want %q", got, "Hello world")
+	}
+
+	stderrLogs := env.logs.String()
+	// 1. Verify per-step advisory lines are NOT in stderr (user reply path)
+	if strings.Contains(stderrLogs, "step 2 has no extractable text") {
+		t.Fatalf("per-step unextractable text advisory leaked into stderr:\n%s", stderrLogs)
+	}
+	if strings.Contains(stderrLogs, "step 3 looks like a tool call but has no name") {
+		t.Fatalf("per-step nameless tool advisory leaked into stderr:\n%s", stderrLogs)
+	}
+
+	// 2. Verify aggregated summary IS present in stderr
+	wantSummary := "turn advisories: 1 step(s) had no extractable text, 1 tool-shaped step(s) lacked names"
+	if !strings.Contains(stderrLogs, wantSummary) {
+		t.Fatalf("expected aggregated summary %q in stderr, got:\n%s", wantSummary, stderrLogs)
+	}
+
+	// 3. Verify bridge.log in stateDir DOES contain the detailed per-step diagnostics
+	bridgeLogBytes, err := os.ReadFile(filepath.Join(env.stateDir, "bridge.log"))
+	if err != nil {
+		t.Fatalf("reading bridge.log: %v", err)
+	}
+	bridgeLogContent := string(bridgeLogBytes)
+	if !strings.Contains(bridgeLogContent, "step 2 has no extractable text") {
+		t.Errorf("bridge.log missing unextractable text advisory:\n%s", bridgeLogContent)
+	}
+	if !strings.Contains(bridgeLogContent, "step 3 looks like a tool call but has no name") {
+		t.Errorf("bridge.log missing nameless tool advisory:\n%s", bridgeLogContent)
+	}
+}
