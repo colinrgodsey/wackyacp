@@ -21,6 +21,8 @@ const (
 	maxStderrTailBytes = 8 * 1024
 	defaultPoll        = 100 * time.Millisecond
 	finalPollTimeout   = 5 * time.Second
+	finalDrainAttempts = 5
+	finalDrainBackoff  = 150 * time.Millisecond
 	killGrace          = 5 * time.Second
 )
 
@@ -269,10 +271,13 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 		emitMu  sync.Mutex
 		emitErr error
 	)
-	pollOnce := func(pollCtx context.Context) {
+	pollOnce := func(pollCtx context.Context) (emitted int, pollErr error, emitErr error) {
 		// Poll logs its own advisory failures (transient lock, schema drift), so
 		// only the emitted updates matter here.
-		updates, _ := poller.Poll(pollCtx)
+		updates, err := poller.Poll(pollCtx)
+		if err != nil {
+			return 0, err, nil
+		}
 		for _, update := range updates {
 			if err := emit(update); err != nil {
 				emitMu.Lock()
@@ -281,10 +286,12 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 				}
 				emitMu.Unlock()
 				cancelChild()
-				return
+				return emitted, nil, emitErr
 			}
 			outcome.UpdatesEmitted++
+			emitted++
 		}
+		return emitted, nil, nil
 	}
 
 	stopPolling := make(chan struct{})
@@ -301,7 +308,7 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 			case <-childCtx.Done():
 				return
 			case <-ticker.C:
-				pollOnce(childCtx)
+				_, _, _ = pollOnce(childCtx)
 			}
 		}
 	}()
@@ -310,11 +317,16 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 	close(stopPolling)
 	pollerDone.Wait()
 
-	// agy writes the tail of a turn before it exits, so poll once more after the
-	// child is gone. A fresh context is used deliberately: the turn context may be
-	// cancelled, and this read is bounded by the read-only open plus busy_timeout.
+	// agy commits the tail of a turn right before it exits, and everything it
+	// committed is visible to a reader once Wait returns - but a single final
+	// read can still fail (transient busy/disk hiccup), and its error would
+	// otherwise be swallowed, silently deferring the tail to the next turn.
+	// Drain until a fully clean read produces no new data, bounded by attempts
+	// and the final deadline. A fresh context is used deliberately: the turn
+	// context may be cancelled, and this read is bounded by the read-only open
+	// plus busy_timeout.
 	finalCtx, finalCancel := context.WithTimeout(context.Background(), finalPollTimeout)
-	pollOnce(finalCtx)
+	b.drainFinal(finalCtx, pollOnce)
 	finalCancel()
 
 	outcome.ConversationID = poller.ConversationID()
@@ -374,4 +386,49 @@ func agentFailureError(waitErr error, stderrTail string) error {
 		return fmt.Errorf("agy failed: %w", waitErr)
 	}
 	return errors.New("agy failed without a message")
+}
+
+// drainFinal polls after the agy process has exited until a fully clean read
+// produces no new data (or the attempts/deadline budget is spent). pollOnce
+// reports three ways: emitted count, a poll-side error (retryable - the data
+// is still on disk), and an emit-side error (delivery is impossible, so
+// draining further is pointless). Without this loop a single failed read
+// would silently defer the turn's tail to the next turn's stream.
+func (b *Bridge) drainFinal(ctx context.Context, pollOnce func(context.Context) (int, error, error)) {
+	for attempt := 1; attempt <= finalDrainAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		emitted, pollErr, emitErr := pollOnce(ctx)
+		if emitErr != nil {
+			return
+		}
+		if pollErr != nil {
+			b.logf("final drain poll %d/%d failed: %v", attempt, finalDrainAttempts, pollErr)
+			if !sleepFinalDrain(ctx) {
+				return
+			}
+			continue
+		}
+		if emitted == 0 {
+			return // clean and quiet: nothing further to drain
+		}
+		// Data moved on this pass; check once more for anything committed
+		// between reads before declaring the tail complete.
+		if !sleepFinalDrain(ctx) {
+			return
+		}
+	}
+	b.logf("final drain budget spent after %d attempts; tail (if any) will surface next turn", finalDrainAttempts)
+}
+
+func sleepFinalDrain(ctx context.Context) bool {
+	t := time.NewTimer(finalDrainBackoff)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
