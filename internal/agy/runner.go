@@ -284,7 +284,7 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 				if emitErr == nil {
 					emitErr = err
 				}
-				emitMu.Unlock()
+				defer emitMu.Unlock()
 				cancelChild()
 				return emitted, nil, emitErr
 			}
@@ -308,6 +308,9 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 			case <-childCtx.Done():
 				return
 			case <-ticker.C:
+				// Mid-turn poll/emit errors are intentionally dropped here: the
+				// next tick retries the same data, and the post-exit drainFinal
+				// loop is the authoritative retry for anything still pending.
 				_, _, _ = pollOnce(childCtx)
 			}
 		}
