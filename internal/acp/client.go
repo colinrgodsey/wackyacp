@@ -210,6 +210,25 @@ func (c *Client) handleResponse(line []byte) {
 	}
 }
 
+// activeTurnRef returns the currently active turn, or nil if no turn is in
+// flight. The reference is stable: Prompt clears activeTurn only after its own
+// deferred closeAndFlush has run.
+func (c *Client) activeTurnRef() *activeTurn {
+	c.activeTurnMu.RLock()
+	defer c.activeTurnMu.RUnlock()
+	return c.activeTurn
+}
+
+// flushActiveTurn flushes whichever turn is active, if any. Call this when a
+// logical message boundary crosses outside the agent_message_chunk stream
+// (harness requests, non-text updates) so buffered deltas emit before the
+// boundary is processed.
+func (c *Client) flushActiveTurn() {
+	if turn := c.activeTurnRef(); turn != nil {
+		_ = turn.flush()
+	}
+}
+
 func (c *Client) handleIncomingRequest(line []byte) {
 	var req rpcRequest
 	if err := json.Unmarshal(line, &req); err != nil {
@@ -218,12 +237,7 @@ func (c *Client) handleIncomingRequest(line []byte) {
 
 	switch req.Method {
 	case "session/request_permission":
-		c.activeTurnMu.RLock()
-		turn := c.activeTurn
-		c.activeTurnMu.RUnlock()
-		if turn != nil {
-			_ = turn.flush()
-		}
+		c.flushActiveTurn()
 
 		var params PermissionRequestParams
 		raw, _ := json.Marshal(req.Params)
@@ -247,10 +261,7 @@ func (c *Client) handleIncomingRequest(line []byte) {
 			}
 			_ = c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil)
 
-			c.activeTurnMu.RLock()
-			turn = c.activeTurn
-			c.activeTurnMu.RUnlock()
-			if turn != nil && turn.callbacks.OnWarning != nil {
+			if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
 				_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", params.ToolCall.Title))
 			}
 			break
@@ -283,10 +294,7 @@ func (c *Client) handleIncomingRequest(line []byte) {
 		_ = c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil)
 
 		// Surface warning over D112
-		c.activeTurnMu.RLock()
-		turn = c.activeTurn
-		c.activeTurnMu.RUnlock()
-
+		turn := c.activeTurnRef()
 		if turn != nil && turn.callbacks.OnWarning != nil {
 			warning := fmt.Sprintf("permission request auto-denied: %s", params.ToolCall.Title)
 			if params.ToolCall.Title == "" {
@@ -311,10 +319,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 	}
 
 	if notif.Method != "session/update" {
-		c.activeTurnMu.RLock()
-		turn := c.activeTurn
-		c.activeTurnMu.RUnlock()
-		if turn != nil {
+		if turn := c.activeTurnRef(); turn != nil {
 			_ = turn.flush()
 			if turn.callbacks.OnWarning != nil {
 				_ = turn.callbacks.OnWarning("unmapped acp notification: " + notif.Method)
@@ -332,9 +337,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		return
 	}
 
-	c.activeTurnMu.RLock()
-	turn := c.activeTurn
-	c.activeTurnMu.RUnlock()
+	turn := c.activeTurnRef()
 	if turn == nil {
 		return
 	}
@@ -368,10 +371,10 @@ func (c *Client) handleIncomingNotification(line []byte) {
 
 	case "usage_update":
 		turn.mu.Lock()
+		defer turn.mu.Unlock()
 		if update.Used > 0 {
 			turn.usage.TotalTokens = update.Used
 		}
-		turn.mu.Unlock()
 
 	default:
 		// Forward unmapped updates as warnings (per D117 and claude review)
@@ -681,17 +684,21 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 
 	_ = json.Unmarshal(resp.Result, &promptResp)
 
-	turn.mu.Lock()
-	if promptResp.Usage != nil {
-		turn.usage.PromptTokens = promptResp.Usage.InputTokens
-		turn.usage.CompletionTokens = promptResp.Usage.OutputTokens
-		turn.usage.TotalTokens = promptResp.Usage.TotalTokens
-	} else if turn.usage.TotalTokens > 0 && turn.usage.PromptTokens == 0 {
-		// When usage came via usage_update
-		turn.usage.PromptTokens = turn.usage.TotalTokens
-	}
-	usage := turn.usage
-	turn.mu.Unlock()
+	// Scoped lock: closeAndFlush re-acquires turn.mu, so the lock must be
+	// released (via the closure's defer) before flushing.
+	usage := func() UsageMetrics {
+		turn.mu.Lock()
+		defer turn.mu.Unlock()
+		if promptResp.Usage != nil {
+			turn.usage.PromptTokens = promptResp.Usage.InputTokens
+			turn.usage.CompletionTokens = promptResp.Usage.OutputTokens
+			turn.usage.TotalTokens = promptResp.Usage.TotalTokens
+		} else if turn.usage.TotalTokens > 0 && turn.usage.PromptTokens == 0 {
+			// When usage came via usage_update
+			turn.usage.PromptTokens = turn.usage.TotalTokens
+		}
+		return turn.usage
+	}()
 
 	_ = turn.closeAndFlush()
 
