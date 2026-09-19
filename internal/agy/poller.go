@@ -19,6 +19,7 @@ type TurnPoller struct {
 	transcript    *Transcript
 	showNarration bool
 	logf          func(format string, args ...any)
+	advisoryLogf  func(format string, args ...any)
 
 	// snapshot is the conversations directory listing taken before spawning, or
 	// nil when this turn continues an already bound conversation.
@@ -31,6 +32,7 @@ type TurnPoller struct {
 	emittedText    map[int64]int
 	emittedTools   map[int64]bool
 	warnedNoText   map[int64]bool
+	warnedNoName   map[int64]bool
 	hadUpdates     bool
 	schemaMissing  bool
 	bindWarned     bool
@@ -53,10 +55,27 @@ func NewTurnPoller(transcript *Transcript, conversationID string, baseIdx int64,
 		snapshot:       snapshot,
 		showNarration:  showNarration,
 		logf:           logf,
+		advisoryLogf:   logf,
 		emittedText:    map[int64]int{},
 		emittedTools:   map[int64]bool{},
 		warnedNoText:   map[int64]bool{},
+		warnedNoName:   map[int64]bool{},
 	}
+}
+
+// SetAdvisoryLog sets a separate logger for per-step poller advisories. If nil,
+// advisories are dropped.
+func (p *TurnPoller) SetAdvisoryLog(fn func(format string, args ...any)) {
+	if fn == nil {
+		fn = func(string, ...any) {}
+	}
+	p.advisoryLogf = fn
+}
+
+// AdvisoryCounts returns the number of steps that had no extractable text and
+// the number of tool-shaped steps that lacked names during this turn.
+func (p *TurnPoller) AdvisoryCounts() (noText int, noName int) {
+	return len(p.warnedNoText), len(p.warnedNoName)
 }
 
 // ConversationID returns the conversation this poller is reading, empty until a
@@ -159,7 +178,7 @@ func (p *TurnPoller) textUpdate(step Step) (Update, bool) {
 	if !ok || text == "" {
 		if !p.warnedNoText[step.Idx] {
 			p.warnedNoText[step.Idx] = true
-			p.logf("step %d has no extractable text (agy field 20.1 missing; schema change?)", step.Idx)
+			p.advisoryLogf("step %d has no extractable text (agy field 20.1 missing; schema change?)", step.Idx)
 		}
 		return Update{}, false
 	}
@@ -190,9 +209,9 @@ func (p *TurnPoller) toolUpdates(step Step) []Update {
 	}
 	call, ok := stepToolCall(step.Payload)
 	if !ok {
-		if !p.warnedNoText[step.Idx] {
-			p.warnedNoText[step.Idx] = true
-			p.logf("step %d looks like a tool call but has no name (agy field 5.4 missing; schema change?)", step.Idx)
+		if !p.warnedNoName[step.Idx] {
+			p.warnedNoName[step.Idx] = true
+			p.advisoryLogf("step %d looks like a tool call but has no name (agy field 5.4 missing; schema change?)", step.Idx)
 		}
 		return nil
 	}

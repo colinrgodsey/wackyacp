@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +93,7 @@ type Bridge struct {
 	models     *ModelProvider
 	starter    agentStarter
 	logf       func(format string, args ...any)
+	fileLogf   func(format string, args ...any)
 
 	writer *lineWriter
 
@@ -100,6 +103,21 @@ type Bridge struct {
 	turns    map[string]*activeTurn
 
 	handlers sync.WaitGroup
+}
+
+// openBridgeLog opens the persistent bridge log file in stateDir.
+func openBridgeLog(stateDir string) io.Writer {
+	if stateDir == "" {
+		return io.Discard
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return io.Discard
+	}
+	f, err := os.OpenFile(filepath.Join(stateDir, "bridge.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return io.Discard
+	}
+	return f
 }
 
 // NewBridge returns a Bridge that spawns the real agy binary.
@@ -121,7 +139,9 @@ func newBridge(cfg Config, starter agentStarter) *Bridge {
 	if logTarget == nil {
 		logTarget = io.Discard
 	}
-	logger := newPrefixLogger(logTarget, "[wackyagy] ")
+	bridgeLog := openBridgeLog(cfg.StateDir)
+	logger := newPrefixLogger(io.MultiWriter(logTarget, bridgeLog), "[wackyagy] ")
+	fileLogger := newPrefixLogger(bridgeLog, "[wackyagy] ")
 
 	if starter == nil {
 		starter = newProcessStarter(cfg)
@@ -133,6 +153,7 @@ func newBridge(cfg Config, starter agentStarter) *Bridge {
 		models:     NewModelProvider(cfg.AgyBin, cfg.StateDir, logger),
 		starter:    starter,
 		logf:       logger,
+		fileLogf:   fileLogger,
 		sessions:   map[string]StoredSession{},
 		turns:      map[string]*activeTurn{},
 	}

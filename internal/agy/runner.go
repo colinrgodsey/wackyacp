@@ -266,6 +266,9 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 	}
 
 	poller := NewTurnPoller(b.transcript, sess.ConversationID, sess.LastStepIdx, conversationSnapshot, b.cfg.ShowNarration, b.logf)
+	if b.fileLogf != nil {
+		poller.SetAdvisoryLog(b.fileLogf)
+	}
 
 	var (
 		emitMu  sync.Mutex
@@ -350,6 +353,18 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 	case waitErr != nil:
 		return outcome, &turnError{Code: CodeServerFailure, Err: agentFailureError(waitErr, proc.StderrTail())}
 	default:
+		noText, noName := poller.AdvisoryCounts()
+		if noText > 0 || noName > 0 {
+			switch {
+			case noText > 0 && noName > 0:
+				b.logf("turn advisories: %d step(s) had no extractable text, %d tool-shaped step(s) lacked names", noText, noName)
+			case noText > 0:
+				b.logf("turn advisories: %d step(s) had no extractable text (agy field 20.1 missing)", noText)
+			case noName > 0:
+				b.logf("turn advisories: %d tool-shaped step(s) lacked names (agy field 5.4 missing)", noName)
+			}
+		}
+
 		// A clean exit that produced nothing is almost always agy hiding a backend
 		// failure; only a log signature can tell that from a genuinely empty answer.
 		if !poller.HadUpdates() {
