@@ -35,6 +35,8 @@ github.com/colinrgodsey/wackypub v0.0.0-20260919183850-4ad0160cc015 h1:kiqOzx+4U
 github.com/colinrgodsey/wackypub v0.0.0-20260919183850-4ad0160cc015/go.mod h1:vc7xo+uYyYFlg0m6xxBoPDeDiW8F3EBhDfZ2DNjRPL0=
 github.com/colinrgodsey/wackypub v0.0.0-20260919184345-92aa1c359824 h1:Szlm3RmECd3+kliuVPgt7CMwhoo5DsMbBao59LVjSJ4=
 github.com/colinrgodsey/wackypub v0.0.0-20260919184345-92aa1c359824/go.mod h1:vc7xo+uYyYFlg0m6xxBoPDeDiW8F3EBhDfZ2DNjRPL0=
+github.com/colinrgodsey/wackypub v0.0.0-20260920013113-1fd624bed4eb h1:Lk4x0+FzkQAol6n10otwzBSkqbQ86HLRD/zoeZ7r50o=
+github.com/colinrgodsey/wackypub v0.0.0-20260920013113-1fd624bed4eb/go.mod h1:vc7xo+uYyYFlg0m6xxBoPDeDiW8F3EBhDfZ2DNjRPL0=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/cyphar/filepath-securejoin v0.6.1 h1:5CeZ1jPXEiYt3+Z6zqprSAgSWiggmpVyciv8syjIpVE=
 github.com/cyphar/filepath-securejoin v0.6.1/go.mod h1:A8hd4EnAeyujCJRrICiOWqjS1AX0a9kM5XL+NwKoYSc=
