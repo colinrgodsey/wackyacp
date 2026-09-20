@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be
-	github.com/colinrgodsey/wackypub v0.0.0-20260919183850-4ad0160cc015
+	github.com/colinrgodsey/wackypub v0.0.0-20260919184345-92aa1c359824
 	google.golang.org/grpc v1.83.2
 	modernc.org/sqlite v1.50.1
 )
