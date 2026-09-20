@@ -432,6 +432,7 @@ func (s *acpShim) run() error {
 
 func main() {
 	script := flag.String("script", "normal", "Scripted failure or execution mode")
+	_ = flag.String("marker", "", "Test-unique marker for process hygiene tracking")
 	flag.Parse()
 
 	shim := &acpShim{

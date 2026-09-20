@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,12 +26,23 @@ import (
 )
 
 var (
+	e2eMarker = fmt.Sprintf("wackyacp-e2e-canary-%d-%d", os.Getpid(), time.Now().UnixNano())
+
 	wackyacpBinOnce sync.Once
 	wackyacpBinPath string
 
 	shimBinOnce sync.Once
 	shimBinPath string
 )
+
+func newTestAgentFolder(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), e2eMarker)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("creating test agent folder: %v", err)
+	}
+	return dir
+}
 
 func getWackyacpBin(t *testing.T) string {
 	wackyacpBinOnce.Do(func() {
@@ -64,18 +77,68 @@ func getShimBin(t *testing.T) string {
 }
 
 type stdioConn struct {
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	cmd    *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	cmd       *exec.Cmd
+	waitDelay time.Duration
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *stdioConn) Read(b []byte) (int, error)  { return c.stdout.Read(b) }
 func (c *stdioConn) Write(b []byte) (int, error) { return c.stdin.Write(b) }
 func (c *stdioConn) Close() error {
-	inErr := c.stdin.Close()
-	outErr := c.stdout.Close()
-	waitErr := c.cmd.Wait()
-	return errors.Join(inErr, outErr, waitErr)
+	c.closeOnce.Do(func() {
+		var inErr, outErr error
+		if c.stdin != nil {
+			inErr = c.stdin.Close()
+		}
+		if c.stdout != nil {
+			outErr = c.stdout.Close()
+		}
+
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- c.cmd.Wait()
+		}()
+
+		waitDelay := c.waitDelay
+		if waitDelay <= 0 {
+			waitDelay = 2 * time.Second
+		}
+
+		var waitErr error
+		select {
+		case waitErr = <-waitDone:
+			// Process exited cleanly on stdin EOF
+		case <-time.After(1 * time.Second):
+			// Process ignored stdin EOF: escalate to SIGTERM on process group
+			if c.cmd.Process != nil {
+				pgid, err := syscall.Getpgid(c.cmd.Process.Pid)
+				if err != nil {
+					pgid = c.cmd.Process.Pid
+				}
+				_ = syscall.Kill(-pgid, syscall.SIGTERM)
+			}
+			select {
+			case waitErr = <-waitDone:
+				// Exited on SIGTERM
+			case <-time.After(waitDelay):
+				// WaitDelay expired: escalate to SIGKILL on process group
+				if c.cmd.Process != nil {
+					pgid, err := syscall.Getpgid(c.cmd.Process.Pid)
+					if err != nil {
+						pgid = c.cmd.Process.Pid
+					}
+					_ = syscall.Kill(-pgid, syscall.SIGKILL)
+				}
+				waitErr = <-waitDone
+			}
+		}
+
+		c.closeErr = errors.Join(inErr, outErr, waitErr)
+	})
+	return c.closeErr
 }
 func (c *stdioConn) LocalAddr() net.Addr                { return stdioAddr{} }
 func (c *stdioConn) RemoteAddr() net.Addr               { return stdioAddr{} }
@@ -95,11 +158,24 @@ func spawnBridge(t *testing.T, ctx context.Context, agentFolder, script string) 
 	args := []string{
 		"--agent-folder=" + agentFolder,
 		"--harness-cmd=" + shimBin,
-		"--harness-args=--script=" + script,
+		"--harness-args=--script=" + script + " -marker=" + e2eMarker,
 	}
 
 	cmd := exec.CommandContext(ctx, wackyacpBin, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	// Go 1.20+ process-group cancellation
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		pgid, err := syscall.Getpgid(cmd.Process.Pid)
+		if err == nil {
+			return syscall.Kill(-pgid, syscall.SIGTERM)
+		}
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 2 * time.Second
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -114,7 +190,7 @@ func spawnBridge(t *testing.T, ctx context.Context, agentFolder, script string) 
 		t.Fatalf("starting wackyacp failed: %v", err)
 	}
 
-	conn := &stdioConn{stdin: stdin, stdout: stdout, cmd: cmd}
+	conn := &stdioConn{stdin: stdin, stdout: stdout, cmd: cmd, waitDelay: 2 * time.Second}
 
 	gc, err := grpc.NewClient(
 		"passthrough:///wackyacp",
@@ -124,7 +200,7 @@ func spawnBridge(t *testing.T, ctx context.Context, agentFolder, script string) 
 		}),
 	)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatalf("grpc.NewClient failed: %v", err)
 	}
 
@@ -134,11 +210,13 @@ func spawnBridge(t *testing.T, ctx context.Context, agentFolder, script string) 
 		_ = conn.Close()
 	}
 
+	t.Cleanup(cleanup)
+
 	return client, cleanup
 }
 
 func TestE2E_AddAndGenerateTurnStream_UsageAndText(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	ctx := context.Background()
 
 	client, cleanup := spawnBridge(t, ctx, agentFolder, "emit-usage")
@@ -195,7 +273,7 @@ func TestE2E_AddAndGenerateTurnStream_UsageAndText(t *testing.T) {
 }
 
 func TestE2E_PermissionAutoDeny(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	ctx := context.Background()
 
 	client, cleanup := spawnBridge(t, ctx, agentFolder, "hang-on-permission")
@@ -237,7 +315,7 @@ func TestE2E_PermissionAutoDeny(t *testing.T) {
 }
 
 func TestE2E_SessionFallbackChain(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	ctx := context.Background()
 
 	// 1. Initial run creates session with "normal"
@@ -292,7 +370,7 @@ func TestE2E_SessionFallbackChain(t *testing.T) {
 }
 
 func TestE2E_UnimplementedRPCs(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	ctx := context.Background()
 
 	client, cleanup := spawnBridge(t, ctx, agentFolder, "normal")
@@ -358,7 +436,7 @@ func TestE2E_FlagValidations(t *testing.T) {
 }
 
 func TestE2E_LockDiscipline_SerializesTurns(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	ctx := context.Background()
 
 	// 1. Pre-take lock manually
@@ -366,6 +444,9 @@ func TestE2E_LockDiscipline_SerializesTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireLock failed: %v", err)
 	}
+	defer func() {
+		_ = lock.Release()
+	}()
 
 	wackyacpBin := getWackyacpBin(t)
 	shimBin := getShimBin(t)
@@ -377,7 +458,9 @@ func TestE2E_LockDiscipline_SerializesTurns(t *testing.T) {
 	cmd := exec.Command(wackyacpBin,
 		"--agent-folder="+agentFolder,
 		"--harness-cmd="+shimBin,
+		"--harness-args=-marker="+e2eMarker,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -391,12 +474,37 @@ func TestE2E_LockDiscipline_SerializesTurns(t *testing.T) {
 		t.Fatalf("cmd.Start failed: %v", err)
 	}
 
+	cmdExited := make(chan struct{})
 	go func() {
 		// Close stdin so wackyacp exits once it acquires lock and starts D112
 		_ = stdin.Close()
 		_, _ = io.ReadAll(stdout)
 		doneCh <- cmd.Wait()
+		close(cmdExited)
 	}()
+
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		select {
+		case <-cmdExited:
+			return
+		default:
+			if cmd.Process != nil {
+				pgid, err := syscall.Getpgid(cmd.Process.Pid)
+				if err != nil {
+					pgid = cmd.Process.Pid
+				}
+				_ = syscall.Kill(-pgid, syscall.SIGTERM)
+				select {
+				case <-cmdExited:
+				case <-time.After(200 * time.Millisecond):
+					_ = syscall.Kill(-pgid, syscall.SIGKILL)
+					<-cmdExited
+				}
+			}
+		}
+	})
 
 	// 3. Hold lock for 200ms, then release
 	time.Sleep(200 * time.Millisecond)
@@ -418,7 +526,7 @@ func TestE2E_LockDiscipline_SerializesTurns(t *testing.T) {
 }
 
 func TestE2E_HarnessIgnoreEOF_ExitsWithinWaitDelay(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	ctx := context.Background()
 
 	// Spawn wackyacp with harness script ignore-eof (which simulates a harness that doesn't exit on stdin EOF)
@@ -474,23 +582,24 @@ func TestE2E_HarnessIgnoreEOF_ExitsWithinWaitDelay(t *testing.T) {
 // "waiting for" stderr line once) and proceeds after the first bridge process
 // exits - NOT corruption.
 func TestE2E_ConcurrentDispatches_WaitThenSucceed(t *testing.T) {
-	agentFolder := t.TempDir()
+	agentFolder := newTestAgentFolder(t)
 	wackyacpBin := getWackyacpBin(t)
 	shimBin := getShimBin(t)
 
 	// Bridge 1: hold-turn keeps the shim alive ~1s so the flock is observably held.
 	// The flock is held for the whole bridge PROCESS lifetime (released when the
 	// process exits, i.e. when its stdin EOFs via conn close).
-	cmd1 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=hold-turn")
+	cmd1 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=hold-turn -marker="+e2eMarker)
 	cmd1.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	stdin1, _ := cmd1.StdinPipe()
 	stdout1, _ := cmd1.StdoutPipe()
 	if err := cmd1.Start(); err != nil {
 		t.Fatalf("start bridge1: %v", err)
 	}
-	conn1 := &stdioConn{stdin: stdin1, stdout: stdout1, cmd: cmd1}
+	conn1 := &stdioConn{stdin: stdin1, stdout: stdout1, cmd: cmd1, waitDelay: 2 * time.Second}
 	g1, _ := grpc.NewClient("passthrough:///w1", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn1, nil }))
 	client1 := agentv1.NewAgentServiceClient(g1)
+	t.Cleanup(func() { _ = g1.Close(); _ = conn1.Close() })
 
 	// Fire bridge1 turn; it blocks ~1s in the shim holding the lock.
 	turn1Done := make(chan struct{})
@@ -515,7 +624,7 @@ func TestE2E_ConcurrentDispatches_WaitThenSucceed(t *testing.T) {
 	// Bridge 2 on the SAME agent folder: blocks in AcquireLock at startup; the D112
 	// server (and therefore the grpc handshake) only comes up after the lock is free.
 	stderrGuard := &guardBuffer{mu: &stderrMu, buf: &stderr2}
-	cmd2 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=normal")
+	cmd2 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=normal -marker="+e2eMarker)
 	cmd2.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd2.Stderr = stderrGuard
 	stdin2, _ := cmd2.StdinPipe()
@@ -523,9 +632,10 @@ func TestE2E_ConcurrentDispatches_WaitThenSucceed(t *testing.T) {
 	if err := cmd2.Start(); err != nil {
 		t.Fatalf("start bridge2: %v", err)
 	}
-	conn2 := &stdioConn{stdin: stdin2, stdout: stdout2, cmd: cmd2}
+	conn2 := &stdioConn{stdin: stdin2, stdout: stdout2, cmd: cmd2, waitDelay: 2 * time.Second}
 	g2, _ := grpc.NewClient("passthrough:///w2", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn2, nil }))
 	client2 := agentv1.NewAgentServiceClient(g2)
+	t.Cleanup(func() { _ = g2.Close(); _ = conn2.Close() })
 	defer func() { _ = g2.Close(); _ = conn2.Close() }()
 
 	// Turn2 in a goroutine: grpc lazy-connect blocks until bridge2 acquires the lock
@@ -602,4 +712,226 @@ func (g *guardBuffer) Write(p []byte) (int, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.buf.Write(p)
+}
+
+type processInfo struct {
+	PID  int
+	Args string
+}
+
+func sweepProcesses(marker string) ([]processInfo, error) {
+	out, err := exec.Command("ps", "-eo", "pid,args").Output()
+	if err != nil {
+		return nil, fmt.Errorf("running ps: %w", err)
+	}
+
+	var strays []processInfo
+	myPID := os.Getpid()
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, marker) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		if pid == myPID {
+			continue
+		}
+		strays = append(strays, processInfo{
+			PID:  pid,
+			Args: strings.Join(fields[1:], " "),
+		})
+	}
+	return strays, nil
+}
+
+func TestE2E_ProcessHygiene_SimulatedFailure(t *testing.T) {
+	t.Run("context_cancellation_kills_process_group", func(t *testing.T) {
+		subMarker := fmt.Sprintf("cancel-sim-%d-%d", os.Getpid(), time.Now().UnixNano())
+		agentFolder := filepath.Join(t.TempDir(), subMarker)
+		if err := os.MkdirAll(agentFolder, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		wackyacpBin := getWackyacpBin(t)
+		shimBin := getShimBin(t)
+
+		args := []string{
+			"--agent-folder=" + agentFolder,
+			"--harness-cmd=" + shimBin,
+			"--harness-args=--script=normal -marker=" + subMarker,
+		}
+
+		cmd := exec.CommandContext(ctx, wackyacpBin, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		cmd.Cancel = func() error {
+			if cmd.Process == nil {
+				return nil
+			}
+			pgid, err := syscall.Getpgid(cmd.Process.Pid)
+			if err == nil {
+				return syscall.Kill(-pgid, syscall.SIGTERM)
+			}
+			return cmd.Process.Signal(syscall.SIGTERM)
+		}
+		cmd.WaitDelay = 2 * time.Second
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatalf("stdin pipe: %v", err)
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatalf("stdout pipe: %v", err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("cmd.Start: %v", err)
+		}
+
+		conn := &stdioConn{stdin: stdin, stdout: stdout, cmd: cmd, waitDelay: 2 * time.Second}
+		t.Cleanup(func() {
+			_ = conn.Close()
+		})
+
+		gc, err := grpc.NewClient(
+			"passthrough:///wackyacp",
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return conn, nil
+			}),
+		)
+		if err != nil {
+			t.Fatalf("grpc.NewClient: %v", err)
+		}
+		defer gc.Close()
+
+		client := agentv1.NewAgentServiceClient(gc)
+		_, err = client.GenerateTurn(ctx, &agentv1.GenerateTurnRequest{
+			AgentId: "test-agent",
+		})
+		if err != nil {
+			t.Fatalf("GenerateTurn: %v", err)
+		}
+
+		// Cancel context while bridge is still running; verify process group dies
+		cancel()
+
+		// Wait briefly for cancellation to take effect
+		time.Sleep(200 * time.Millisecond)
+
+		strays, err := sweepProcesses(subMarker)
+		if err != nil {
+			t.Fatalf("sweepProcesses failed: %v", err)
+		}
+		if len(strays) > 0 {
+			t.Fatalf("expected 0 strays after context cancel, got %d: %+v", len(strays), strays)
+		}
+	})
+
+	t.Run("t_fatal_cleanup_enforcement_kills_process_group", func(t *testing.T) {
+		subMarker := fmt.Sprintf("fatal-sim-%d-%d", os.Getpid(), time.Now().UnixNano())
+		agentFolder := filepath.Join(t.TempDir(), subMarker)
+		if err := os.MkdirAll(agentFolder, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		// Run in a subtest where t.Fatal / early exit happens without manual cleanup
+		t.Run("subtest_without_cleanup", func(subT *testing.T) {
+			ctx := context.Background()
+			client, _ := spawnBridge(subT, ctx, agentFolder, "ignore-eof")
+
+			// Execute a turn
+			stream, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+				AgentId:     "test-agent",
+				UserMessage: "hello fatal sim",
+			})
+			if err != nil {
+				subT.Fatalf("AddAndGenerateTurnStream: %v", err)
+			}
+			for {
+				_, err := stream.Recv()
+				if err != nil {
+					break
+				}
+			}
+
+			// Subtest ends WITHOUT calling cleanup(). subT.Cleanup must kill the process group.
+		})
+
+		// Give cleanup a moment to reap processes
+		time.Sleep(200 * time.Millisecond)
+
+		strays, err := sweepProcesses(subMarker)
+		if err != nil {
+			t.Fatalf("sweepProcesses failed: %v", err)
+		}
+		if len(strays) > 0 {
+			t.Fatalf("expected 0 strays after subtest cleanup enforcement, got %d: %+v", len(strays), strays)
+		}
+	})
+
+	t.Run("uncooperative_harness_cleanup_kills_process_group", func(t *testing.T) {
+		subMarker := fmt.Sprintf("uncoop-sim-%d-%d", os.Getpid(), time.Now().UnixNano())
+		agentFolder := filepath.Join(t.TempDir(), subMarker)
+		if err := os.MkdirAll(agentFolder, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		ctx := context.Background()
+		client, cleanup := spawnBridge(t, ctx, agentFolder, "ignore-eof")
+
+		stream, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+			AgentId:     "test-agent",
+			UserMessage: "hello uncoop",
+		})
+		if err != nil {
+			cleanup()
+			t.Fatalf("AddAndGenerateTurnStream: %v", err)
+		}
+		for {
+			_, err := stream.Recv()
+			if err != nil {
+				break
+			}
+		}
+
+		cleanup()
+
+		strays, err := sweepProcesses(subMarker)
+		if err != nil {
+			t.Fatalf("sweepProcesses failed: %v", err)
+		}
+		if len(strays) > 0 {
+			t.Fatalf("expected 0 strays after uncooperative cleanup, got %d: %+v", len(strays), strays)
+		}
+	})
+}
+
+func TestZZZ_Canary_NoOrphanProcesses(t *testing.T) {
+	// Assert no stray wackyacp or harness processes tagged with e2eMarker remain after the suite
+	strays, err := sweepProcesses(e2eMarker)
+	if err != nil {
+		t.Fatalf("sweeping processes for marker %q: %v", e2eMarker, err)
+	}
+	if len(strays) > 0 {
+		var details []string
+		for _, s := range strays {
+			details = append(details, fmt.Sprintf("PID %d: %s", s.PID, s.Args))
+			// Kill stray to avoid polluting the host
+			_ = syscall.Kill(-s.PID, syscall.SIGKILL)
+			_ = syscall.Kill(s.PID, syscall.SIGKILL)
+		}
+		t.Fatalf("found %d stray orphaned process(es) matching marker %q:\n%s",
+			len(strays), e2eMarker, strings.Join(details, "\n"))
+	}
 }
