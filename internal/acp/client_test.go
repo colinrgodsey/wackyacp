@@ -796,3 +796,204 @@ func TestClient_Coalesce_CancelSafety(t *testing.T) {
 		}
 	}
 }
+
+func TestClient_Permission_DisallowBug(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	client.PermissionMode = "approve"
+
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      100,
+		"method":  "session/request_permission",
+		"params": map[string]any{
+			"sessionId": "sess-perm-1",
+			"toolCall": map[string]any{
+				"toolCallId": "call_1",
+				"title":      "Delete Everything",
+			},
+			"options": []map[string]any{
+				{
+					"optionId": "disallow_once",
+					"name":     "Disallow",
+					"kind":     "",
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(req)
+	_, _ = fmt.Fprintf(harness.inWriter, "%s\n", data)
+
+	resp, id := harness.readRequest()
+	if id != 100 {
+		t.Fatalf("expected id 100, got %d", id)
+	}
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result object, got %v", resp)
+	}
+	outcome, ok := result["outcome"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected outcome object, got %v", result)
+	}
+	if outcome["outcome"] != "cancelled" {
+		t.Errorf("expected cancelled for Disallow option in approve mode, got %v", outcome["outcome"])
+	}
+	if outcome["optionId"] != nil {
+		t.Errorf("expected nil optionId, got %v", outcome["optionId"])
+	}
+}
+
+func TestClient_Permission_KindPriorityAndAllowMatch(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	client.PermissionMode = "approve"
+
+	// 1. Kind matches even if Name has nothing to do with allow
+	req1 := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      101,
+		"method":  "session/request_permission",
+		"params": map[string]any{
+			"sessionId": "sess-perm-2",
+			"toolCall": map[string]any{
+				"toolCallId": "call_2",
+				"title":      "Run tool",
+			},
+			"options": []map[string]any{
+				{
+					"optionId": "opt_kind_allow",
+					"name":     "Proceed With Action",
+					"kind":     "allow_once",
+				},
+			},
+		},
+	}
+	data1, _ := json.Marshal(req1)
+	_, _ = fmt.Fprintf(harness.inWriter, "%s\n", data1)
+
+	resp1, _ := harness.readRequest()
+	result1 := resp1["result"].(map[string]any)
+	outcome1 := result1["outcome"].(map[string]any)
+	if outcome1["outcome"] != "selected" || outcome1["optionId"] != "opt_kind_allow" {
+		t.Errorf("expected opt_kind_allow selected, got %v", outcome1)
+	}
+
+	// 2. Token match on "Allow" when Kind is missing
+	req2 := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      102,
+		"method":  "session/request_permission",
+		"params": map[string]any{
+			"sessionId": "sess-perm-2",
+			"toolCall": map[string]any{
+				"toolCallId": "call_3",
+				"title":      "Run tool 2",
+			},
+			"options": []map[string]any{
+				{
+					"optionId": "opt_token_allow",
+					"name":     "Allow this once",
+					"kind":     "",
+				},
+			},
+		},
+	}
+	data2, _ := json.Marshal(req2)
+	_, _ = fmt.Fprintf(harness.inWriter, "%s\n", data2)
+
+	resp2, _ := harness.readRequest()
+	result2 := resp2["result"].(map[string]any)
+	outcome2 := result2["outcome"].(map[string]any)
+	if outcome2["outcome"] != "selected" || outcome2["optionId"] != "opt_token_allow" {
+		t.Errorf("expected opt_token_allow selected, got %v", outcome2)
+	}
+}
+
+func TestClient_Permission_DecodeError(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var warnings []string
+	var warningsMu sync.Mutex
+	callbacks := TurnCallbacks{
+		OnWarning: func(w string) error {
+			warningsMu.Lock()
+			warnings = append(warnings, w)
+			warningsMu.Unlock()
+			return nil
+		},
+	}
+
+	// Set active turn with callbacks
+	client.activeTurnMu.Lock()
+	client.activeTurn = &activeTurn{
+		sessionID: "sess-err",
+		callbacks: callbacks,
+	}
+	client.activeTurnMu.Unlock()
+
+	// Send request with malformed params (options is string instead of array)
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      103,
+		"method":  "session/request_permission",
+		"params": map[string]any{
+			"sessionId": "sess-err",
+			"options":   "not-an-array",
+		},
+	}
+	data, _ := json.Marshal(req)
+	_, _ = fmt.Fprintf(harness.inWriter, "%s\n", data)
+
+	resp, id := harness.readRequest()
+	if id != 103 {
+		t.Fatalf("expected id 103, got %d", id)
+	}
+	errObj, ok := resp["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object in response, got %v", resp)
+	}
+	code, _ := errObj["code"].(float64)
+	if int(code) != CodeInvalidParams {
+		t.Errorf("expected error code %d, got %v", CodeInvalidParams, code)
+	}
+
+	warningsMu.Lock()
+	defer warningsMu.Unlock()
+	for _, w := range warnings {
+		if strings.Contains(w, "auto-approved: ") || strings.Contains(w, "auto-denied: ") {
+			t.Errorf("unexpected auto-approval/denial warning on decode failure: %q", w)
+		}
+	}
+}
+
+func TestClient_Prompt_ResponseDecodeError(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, id := harness.readRequest()
+		// Respond with malformed result (not an object matching promptResponse)
+		resp := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"result":  "this-is-not-a-valid-json-object-for-prompt-response",
+		}
+		data, _ := json.Marshal(resp)
+		_, _ = fmt.Fprintf(harness.inWriter, "%s\n", data)
+	}()
+
+	_, err := client.Prompt(context.Background(), "sess-decode-err", "test prompt", TurnCallbacks{})
+	<-done
+	if err == nil {
+		t.Fatalf("expected Prompt to fail on malformed response, got nil")
+	}
+	if !strings.Contains(err.Error(), "decoding session/prompt response") {
+		t.Errorf("expected error message to mention decoding session/prompt response, got: %v", err)
+	}
+}

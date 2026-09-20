@@ -236,80 +236,198 @@ func (c *Client) handleIncomingRequest(line []byte) {
 	}
 
 	switch req.Method {
-	case "session/request_permission":
+	case MethodSessionRequestPermission:
 		c.flushActiveTurn()
 
+		raw, err := json.Marshal(req.Params)
+		if err != nil {
+			c.respondPermissionError(req.ID, CodeInvalidParams, fmt.Sprintf("marshaling request params: %v", err))
+			break
+		}
 		var params PermissionRequestParams
-		raw, _ := json.Marshal(req.Params)
-		_ = json.Unmarshal(raw, &params)
+		if err := json.Unmarshal(raw, &params); err != nil {
+			c.respondPermissionError(req.ID, CodeInvalidParams, fmt.Sprintf("invalid %s params: %v", MethodSessionRequestPermission, err))
+			break
+		}
 
 		if c.PermissionMode == "approve" {
 			// Approve posture: pick the first allow option so the harness can run
 			// its tools. Only meaningful for trusted local harnesses.
-			var chosenOptionID string
-			for _, opt := range params.Options {
-				if opt.Kind == "allow_once" || opt.Kind == "allow_always" ||
-					strings.Contains(strings.ToLower(opt.Name), "allow") ||
-					strings.Contains(strings.ToLower(opt.OptionID), "allow") {
-					chosenOptionID = opt.OptionID
-					break
+			chosenOptionID := selectAllowOption(params.Options)
+			var outcome map[string]any
+			if chosenOptionID != "" {
+				outcome = map[string]any{"outcome": OutcomeSelected, "optionId": chosenOptionID}
+			} else {
+				outcome = map[string]any{"outcome": OutcomeCancelled}
+			}
+			if err := c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil); err != nil {
+				if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
+					_ = turn.callbacks.OnWarning(fmt.Sprintf("failed to send permission response: %v", err))
 				}
 			}
-			outcome := map[string]any{"outcome": "cancelled"}
-			if chosenOptionID != "" {
-				outcome = map[string]any{"outcome": "selected", "optionId": chosenOptionID}
-			}
-			_ = c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil)
 
 			if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
-				_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", params.ToolCall.Title))
+				title := params.ToolCall.Title
+				if title == "" {
+					title = params.ToolCall.ToolCallID
+				}
+				if chosenOptionID != "" {
+					_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", title))
+				} else {
+					_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approve failed (no allow option matched): %s", title))
+				}
 			}
 			break
 		}
 
 		// Auto-deny posture (D117 Decision)
-		var chosenOptionID string
-		for _, opt := range params.Options {
-			if opt.Kind == "reject_once" || opt.Kind == "reject_always" ||
-				strings.Contains(strings.ToLower(opt.Name), "deny") ||
-				strings.Contains(strings.ToLower(opt.OptionID), "deny") {
-				chosenOptionID = opt.OptionID
-				break
-			}
-		}
-
-		var outcome any
+		chosenOptionID := selectDenyOption(params.Options)
+		var outcome map[string]any
 		if chosenOptionID != "" {
 			outcome = map[string]any{
-				"outcome":  "selected",
+				"outcome":  OutcomeSelected,
 				"optionId": chosenOptionID,
 			}
 		} else {
 			outcome = map[string]any{
-				"outcome": "cancelled",
+				"outcome": OutcomeCancelled,
 			}
 		}
 
 		// Send deny response back over ACP to unblock harness
-		_ = c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil)
+		if err := c.sendResponse(req.ID, map[string]any{"outcome": outcome}, nil); err != nil {
+			if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
+				_ = turn.callbacks.OnWarning(fmt.Sprintf("failed to send permission response: %v", err))
+			}
+		}
 
 		// Surface warning over D112
 		turn := c.activeTurnRef()
 		if turn != nil && turn.callbacks.OnWarning != nil {
-			warning := fmt.Sprintf("permission request auto-denied: %s", params.ToolCall.Title)
-			if params.ToolCall.Title == "" {
-				warning = fmt.Sprintf("permission request auto-denied for tool call %s", params.ToolCall.ToolCallID)
+			title := params.ToolCall.Title
+			if title == "" {
+				title = params.ToolCall.ToolCallID
 			}
+			warning := fmt.Sprintf("permission request auto-denied: %s", title)
 			_ = turn.callbacks.OnWarning(warning)
 		}
 
 	default:
 		// Unsupported incoming request
-		_ = c.sendResponse(req.ID, nil, &RPCError{
-			Code:    -32601,
+		if err := c.sendResponse(req.ID, nil, &RPCError{
+			Code:    CodeMethodNotFound,
 			Message: fmt.Sprintf("method %q not supported", req.Method),
-		})
+		}); err != nil {
+			if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
+				_ = turn.callbacks.OnWarning(fmt.Sprintf("failed to send error response for unsupported method %q: %v", req.Method, err))
+			}
+		}
 	}
+}
+
+func (c *Client) respondPermissionError(reqID any, code int, msg string) {
+	if err := c.sendResponse(reqID, nil, &RPCError{
+		Code:    code,
+		Message: msg,
+	}); err != nil {
+		if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
+			_ = turn.callbacks.OnWarning(fmt.Sprintf("failed to send permission error response: %v", err))
+		}
+	}
+	if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
+		_ = turn.callbacks.OnWarning(fmt.Sprintf("permission request error: %s", msg))
+	}
+}
+
+// selectAllowOption chooses an approval option for trusted local harnesses.
+// It prioritizes standard ACP kind values (allow_once, allow_always).
+// If kind is missing, it falls back to token/boundary matching, never matching
+// strings that indicate rejection (e.g. "disallow", "reject", "deny").
+func selectAllowOption(options []PermissionOption) string {
+	// 1. Kind-first selection
+	for _, opt := range options {
+		if opt.Kind == OptionKindAllowOnce || opt.Kind == OptionKindAllowAlways {
+			return opt.OptionID
+		}
+	}
+
+	// 2. Fallback: match on exact name/id or token boundary
+	for _, opt := range options {
+		if opt.Kind == OptionKindRejectOnce || opt.Kind == OptionKindRejectAlways {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(opt.Name))
+		optID := strings.ToLower(strings.TrimSpace(opt.OptionID))
+
+		if isRejectIdentifier(name) || isRejectIdentifier(optID) {
+			continue
+		}
+
+		if isAllowTokenMatch(name) || isAllowTokenMatch(optID) {
+			return opt.OptionID
+		}
+	}
+	return ""
+}
+
+// selectDenyOption chooses a rejection option.
+// It prioritizes standard ACP kind values (reject_once, reject_always).
+// If kind is missing, it falls back to token/boundary matching.
+func selectDenyOption(options []PermissionOption) string {
+	// 1. Kind-first selection
+	for _, opt := range options {
+		if opt.Kind == OptionKindRejectOnce || opt.Kind == OptionKindRejectAlways {
+			return opt.OptionID
+		}
+	}
+
+	// 2. Fallback: match on exact name/id or token boundary
+	for _, opt := range options {
+		if opt.Kind == OptionKindAllowOnce || opt.Kind == OptionKindAllowAlways {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(opt.Name))
+		optID := strings.ToLower(strings.TrimSpace(opt.OptionID))
+
+		if isAllowTokenMatch(name) || isAllowTokenMatch(optID) {
+			continue
+		}
+
+		if isRejectIdentifier(name) || isRejectIdentifier(optID) {
+			return opt.OptionID
+		}
+	}
+	return ""
+}
+
+func isRejectIdentifier(s string) bool {
+	if strings.HasPrefix(s, "dis") || strings.HasPrefix(s, "reject") || strings.HasPrefix(s, "deny") {
+		return true
+	}
+	words := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ' ' || r == '_' || r == '-' || r == '/'
+	})
+	for _, w := range words {
+		if w == "reject" || w == "deny" || w == "disallow" {
+			return true
+		}
+	}
+	return false
+}
+
+func isAllowTokenMatch(s string) bool {
+	if s == "allow" || s == "allow_once" || s == "allow_always" || s == "allow once" || s == "allow always" {
+		return true
+	}
+	words := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ' ' || r == '_' || r == '-' || r == '/'
+	})
+	for _, w := range words {
+		if w == "allow" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) handleIncomingNotification(line []byte) {
@@ -318,7 +436,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		return
 	}
 
-	if notif.Method != "session/update" {
+	if notif.Method != MethodSessionUpdate {
 		if turn := c.activeTurnRef(); turn != nil {
 			_ = turn.flush()
 			if turn.callbacks.OnWarning != nil {
@@ -355,12 +473,12 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		return
 	}
 
-	if update.SessionUpdate != "agent_message_chunk" {
+	if update.SessionUpdate != UpdateKindAgentMessageChunk {
 		_ = turn.flush()
 	}
 
 	switch update.SessionUpdate {
-	case "agent_message_chunk":
+	case UpdateKindAgentMessageChunk:
 		var content struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -369,7 +487,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 			turn.appendText(content.Text)
 		}
 
-	case "usage_update":
+	case UpdateKindUsageUpdate:
 		turn.mu.Lock()
 		defer turn.mu.Unlock()
 		if update.Used > 0 {
@@ -501,7 +619,7 @@ func (c *Client) Initialize(ctx context.Context) (*InitializeResult, error) {
 		},
 	}
 
-	resp, err := c.sendRequest(ctx, "initialize", params)
+	resp, err := c.sendRequest(ctx, MethodInitialize, params)
 	if err != nil {
 		return nil, fmt.Errorf("acp initialize handshake failed: %w", err)
 	}
@@ -524,7 +642,7 @@ func (c *Client) ResumeSession(ctx context.Context, sessionID, agentFolder strin
 			"agent_folder": agentFolder,
 		},
 	}
-	resp, err := c.sendRequest(ctx, "session/resume", params)
+	resp, err := c.sendRequest(ctx, MethodSessionResume, params)
 	if err != nil {
 		return err
 	}
@@ -552,7 +670,7 @@ func (c *Client) LoadSession(ctx context.Context, sessionID, agentFolder string)
 			"agent_folder": agentFolder,
 		},
 	}
-	resp, err := c.sendRequest(ctx, "session/load", params)
+	resp, err := c.sendRequest(ctx, MethodSessionLoad, params)
 	if err != nil {
 		return err
 	}
@@ -580,9 +698,9 @@ func (c *Client) NewSession(ctx context.Context, agentFolder string) (string, er
 			"agent_folder": agentFolder,
 		},
 	}
-	resp, err := c.sendRequest(ctx, "session/new", params)
+	resp, err := c.sendRequest(ctx, MethodSessionNew, params)
 	if err != nil {
-		return "", fmt.Errorf("session/new failed: %w", err)
+		return "", fmt.Errorf("%s failed: %w", MethodSessionNew, err)
 	}
 
 	var result NewSessionResult
@@ -590,7 +708,7 @@ func (c *Client) NewSession(ctx context.Context, agentFolder string) (string, er
 		return "", fmt.Errorf("unmarshaling new session result: %w", err)
 	}
 	if result.SessionID == "" {
-		return "", errors.New("empty sessionId returned from session/new")
+		return "", fmt.Errorf("empty sessionId returned from %s", MethodSessionNew)
 	}
 	return result.SessionID, nil
 }
@@ -668,21 +786,19 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 		},
 	}
 
-	resp, err := c.sendRequest(ctx, "session/prompt", params)
+	resp, err := c.sendRequest(ctx, MethodSessionPrompt, params)
 	if err != nil {
 		return nil, err
 	}
 
-	var promptResp struct {
-		StopReason string `json:"stopReason"`
-		Usage      *struct {
-			InputTokens  int64 `json:"inputTokens"`
-			OutputTokens int64 `json:"outputTokens"`
-			TotalTokens  int64 `json:"totalTokens"`
-		} `json:"usage"`
+	var promptResp promptResponse
+	if err := json.Unmarshal(resp.Result, &promptResp); err != nil {
+		sample := string(resp.Result)
+		if len(sample) > 120 {
+			sample = sample[:120] + "..."
+		}
+		return nil, fmt.Errorf("decoding %s response (got %s): %w", MethodSessionPrompt, sample, err)
 	}
-
-	_ = json.Unmarshal(resp.Result, &promptResp)
 
 	// Scoped lock: closeAndFlush re-acquires turn.mu, so the lock must be
 	// released (via the closure's defer) before flushing.
@@ -700,7 +816,11 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 		return turn.usage
 	}()
 
-	_ = turn.closeAndFlush()
+	// Explicit flush before returning so chunk delivery errors propagate;
+	// deferred closeAndFlush is an idempotent safety net.
+	if err := turn.closeAndFlush(); err != nil {
+		return nil, fmt.Errorf("flushing message buffer: %w", err)
+	}
 
 	return &PromptResult{
 		StopReason: promptResp.StopReason,
@@ -710,7 +830,7 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 
 // Cancel sends a session/cancel notification to abort an in-flight prompt turn.
 func (c *Client) Cancel(sessionID string) error {
-	return c.sendNotification("session/cancel", map[string]any{
+	return c.sendNotification(MethodSessionCancel, map[string]any{
 		"sessionId": sessionID,
 	})
 }
