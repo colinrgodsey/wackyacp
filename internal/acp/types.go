@@ -75,6 +75,15 @@ type PromptResult struct {
 	Usage      UsageMetrics
 }
 
+type promptResponse struct {
+	StopReason string `json:"stopReason"`
+	Usage      *struct {
+		InputTokens  int64 `json:"inputTokens"`
+		OutputTokens int64 `json:"outputTokens"`
+		TotalTokens  int64 `json:"totalTokens"`
+	} `json:"usage"`
+}
+
 // UsageMetrics holds accumulated token usage.
 type UsageMetrics struct {
 	PromptTokens     int64
