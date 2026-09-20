@@ -297,85 +297,138 @@ func (b *Bridge) runTurn(ctx context.Context, turn *activeTurn, promptText strin
 		return emitted, nil, nil
 	}
 
-	stopPolling := make(chan struct{})
-	var pollerDone sync.WaitGroup
-	pollerDone.Add(1)
+	// 1. Poll: stream updates while the child runs.
+	stopPoller, pollerDone := b.startPoller(childCtx, pollOnce)
+
+	// 2. Wait: wait for the child process to exit, then tear down the poller ticker.
+	waitErr := proc.Wait()
+	stopPoller()
+	<-pollerDone
+
+	// 3. Drain: drain the tail of the turn until quiet or budget exhausted.
+	b.drainTurnFinal(context.Background(), pollOnce)
+
+	outcome.ConversationID = poller.ConversationID()
+	outcome.LastStepIdx = poller.LastIdx()
+
+	// 4. Deliver: check for delivery errors.
+	emitMu.Lock()
+	deliverErr := emitErr
+	emitMu.Unlock()
+
+	// 5. Map: evaluate outcome and return.
+	return b.mapOutcome(ctx, turn, poller, outcome, waitErr, proc.StderrTail(), deliverErr, logPre, spawned)
+}
+
+// startPoller launches a goroutine that periodically polls for updates while the
+// agent process runs. It returns a stop function to terminate polling and a done
+// channel that closes when the polling goroutine has exited.
+func (b *Bridge) startPoller(ctx context.Context, pollOnce func(context.Context) (int, error, error)) (func(), <-chan struct{}) {
+	stop := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		defer pollerDone.Done()
+		defer close(done)
 		ticker := time.NewTicker(b.pollInterval())
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stopPolling:
+			case <-stop:
 				return
-			case <-childCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				// Mid-turn poll/emit errors are intentionally dropped here: the
 				// next tick retries the same data, and the post-exit drainFinal
 				// loop is the authoritative retry for anything still pending.
-				_, _, _ = pollOnce(childCtx)
+				_, _, _ = pollOnce(ctx)
 			}
 		}
 	}()
+	var stopOnce sync.Once
+	stopFunc := func() {
+		stopOnce.Do(func() {
+			close(stop)
+		})
+	}
+	return stopFunc, done
+}
 
-	waitErr := proc.Wait()
-	close(stopPolling)
-	pollerDone.Wait()
-
-	// agy commits the tail of a turn right before it exits, and everything it
-	// committed is visible to a reader once Wait returns - but a single final
-	// read can still fail (transient busy/disk hiccup), and its error would
-	// otherwise be swallowed, silently deferring the tail to the next turn.
-	// Drain until a fully clean read produces no new data, bounded by attempts
-	// and the final deadline. A fresh context is used deliberately: the turn
-	// context may be cancelled, and this read is bounded by the read-only open
-	// plus busy_timeout.
-	finalCtx, finalCancel := context.WithTimeout(context.Background(), finalPollTimeout)
+// drainTurnFinal polls after the agy process has exited until a fully clean read
+// produces no new data, bounded by finalDrainAttempts and finalPollTimeout.
+// A fresh context is used deliberately when called by runTurn: the turn
+// context may be cancelled, and this read is bounded by the read-only open
+// plus busy_timeout.
+func (b *Bridge) drainTurnFinal(ctx context.Context, pollOnce func(context.Context) (int, error, error)) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	finalCtx, finalCancel := context.WithTimeout(ctx, finalPollTimeout)
+	defer finalCancel()
 	b.drainFinal(finalCtx, pollOnce)
-	finalCancel()
+}
 
-	outcome.ConversationID = poller.ConversationID()
-	outcome.LastStepIdx = poller.LastIdx()
+// turnPollerOutcome abstracts the subset of TurnPoller methods needed by mapOutcome.
+type turnPollerOutcome interface {
+	AdvisoryCounts() (noText int, noName int)
+	HadUpdates() bool
+	SchemaMissing() bool
+}
 
-	emitMu.Lock()
-	deliverErr := emitErr
-	emitMu.Unlock()
+// mapOutcome evaluates the turn's outcome after the agent process and final drain have
+// completed, translating cancellation, process failure, delivery errors, or clean completion
+// into a turnOutcome and error.
+func (b *Bridge) mapOutcome(
+	ctx context.Context,
+	turn *activeTurn,
+	poller turnPollerOutcome,
+	outcome turnOutcome,
+	waitErr error,
+	stderrTail string,
+	deliverErr error,
+	logPre logSnapshot,
+	spawned time.Time,
+) (turnOutcome, error) {
 	if deliverErr != nil {
 		return outcome, fmt.Errorf("delivering session/update: %w", deliverErr)
 	}
 
 	switch {
-	case turn.WasCancelled():
+	case turn != nil && turn.WasCancelled():
 		outcome.StopReason = StopReasonCancelled
-	case ctx.Err() != nil:
+	case ctx != nil && ctx.Err() != nil:
 		return outcome, fmt.Errorf("turn aborted: %w", ctx.Err())
 	case waitErr != nil:
-		return outcome, &turnError{Code: CodeServerFailure, Err: agentFailureError(waitErr, proc.StderrTail())}
+		return outcome, &turnError{Code: CodeServerFailure, Err: agentFailureError(waitErr, stderrTail)}
 	default:
-		noText, noName := poller.AdvisoryCounts()
-		if noText > 0 || noName > 0 {
-			switch {
-			case noText > 0 && noName > 0:
-				b.logf("turn advisories: %d step(s) had no extractable text, %d tool-shaped step(s) lacked names", noText, noName)
-			case noText > 0:
-				b.logf("turn advisories: %d step(s) had no extractable text (agy field 20.1 missing)", noText)
-			case noName > 0:
-				b.logf("turn advisories: %d tool-shaped step(s) lacked names (agy field 5.4 missing)", noName)
-			}
+		logf := b.logf
+		if logf == nil {
+			logf = func(string, ...any) {}
 		}
-
-		// A clean exit that produced nothing is almost always agy hiding a backend
-		// failure; only a log signature can tell that from a genuinely empty answer.
-		if !poller.HadUpdates() {
-			switch {
-			case outcome.ConversationID == "":
-				b.logf("agy exited without creating a conversation in %s: this turn had no output to stream", b.cfg.ConversationsDir)
-			case poller.SchemaMissing():
-				b.logf("conversation %s never gained a steps table: agy changed its schema, so nothing could be streamed", outcome.ConversationID)
+		if poller != nil {
+			noText, noName := poller.AdvisoryCounts()
+			if noText > 0 || noName > 0 {
+				switch {
+				case noText > 0 && noName > 0:
+					logf("turn advisories: %d step(s) had no extractable text, %d tool-shaped step(s) lacked names", noText, noName)
+				case noText > 0:
+					logf("turn advisories: %d step(s) had no extractable text (agy field 20.1 missing)", noText)
+				case noName > 0:
+					logf("turn advisories: %d tool-shaped step(s) lacked names (agy field 5.4 missing)", noName)
+				}
 			}
-			if msg, ok := detectSwallowedError(b.cfg.LogDir, logPre, spawned); ok {
-				return outcome, &turnError{Code: CodeInternalError, Err: errors.New(msg)}
+
+			// A clean exit that produced nothing is almost always agy hiding a backend
+			// failure; only a log signature can tell that from a genuinely empty answer.
+			if !poller.HadUpdates() {
+				switch {
+				case outcome.ConversationID == "":
+					logf("agy exited without creating a conversation in %s: this turn had no output to stream", b.cfg.ConversationsDir)
+				case poller.SchemaMissing():
+					logf("conversation %s never gained a steps table: agy changed its schema, so nothing could be streamed", outcome.ConversationID)
+				}
+				if msg, ok := detectSwallowedError(b.cfg.LogDir, logPre, spawned); ok {
+					return outcome, &turnError{Code: CodeInternalError, Err: errors.New(msg)}
+				}
 			}
 		}
 		outcome.StopReason = StopReasonEndTurn
