@@ -404,7 +404,9 @@ func (b *Bridge) mapOutcome(
 		if logf == nil {
 			logf = func(string, ...any) {}
 		}
+		hadUpdates := false
 		if poller != nil {
+			hadUpdates = poller.HadUpdates()
 			noText, noName := poller.AdvisoryCounts()
 			if noText > 0 || noName > 0 {
 				switch {
@@ -419,16 +421,23 @@ func (b *Bridge) mapOutcome(
 
 			// A clean exit that produced nothing is almost always agy hiding a backend
 			// failure; only a log signature can tell that from a genuinely empty answer.
-			if !poller.HadUpdates() {
+			if !hadUpdates {
 				switch {
 				case outcome.ConversationID == "":
 					logf("agy exited without creating a conversation in %s: this turn had no output to stream", b.cfg.ConversationsDir)
 				case poller.SchemaMissing():
 					logf("conversation %s never gained a steps table: agy changed its schema, so nothing could be streamed", outcome.ConversationID)
 				}
-				if msg, ok := detectSwallowedError(b.cfg.LogDir, logPre, spawned); ok {
-					return outcome, &turnError{Code: CodeInternalError, Err: errors.New(msg)}
-				}
+			}
+		} else {
+			// poller is only nil in synthetic unit test harnesses; in production runTurn it is
+			// always populated. When nil, update detection falls back to outcome.UpdatesEmitted.
+			hadUpdates = outcome.UpdatesEmitted > 0
+		}
+
+		if !hadUpdates {
+			if msg, ok := detectSwallowedError(b.cfg.LogDir, logPre, spawned); ok {
+				return outcome, &turnError{Code: CodeInternalError, Err: errors.New(msg)}
 			}
 		}
 		outcome.StopReason = StopReasonEndTurn

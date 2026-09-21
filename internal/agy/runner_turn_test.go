@@ -2,9 +2,13 @@ package agy
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -395,5 +399,120 @@ func TestMapOutcome_LogsMissingConversationAndSchema(t *testing.T) {
 	}
 	if !foundSchema {
 		t.Errorf("expected schema missing log, got %v", logged)
+	}
+}
+
+func TestMapOutcome_NilPollerSwallowedError(t *testing.T) {
+	logDir := t.TempDir()
+	logPath := filepath.Join(logDir, "cli-1.log")
+	pre, _ := snapshotLogs(logDir)
+
+	b := &Bridge{
+		cfg:  Config{LogDir: logDir, ConversationsDir: t.TempDir()},
+		logf: func(string, ...any) {},
+	}
+
+	spawned := time.Now()
+	if err := os.WriteFile(logPath, []byte("error: RESOURCE_EXHAUSTED: quota exceeded\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := turnOutcome{ConversationID: "conv-1", UpdatesEmitted: 0}
+	_, err := b.mapOutcome(context.Background(), nil, nil, outcome, nil, "", nil, pre, spawned)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+		t.Errorf("expected error to contain RESOURCE_EXHAUSTED, got %v", err)
+	}
+}
+
+func TestRunTurn_DrainCannotOverlapPollTick(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.config()
+	// Poll interval set to 2ms so ticks fire aggressively while the poller is alive
+	cfg.PollInterval = 2 * time.Millisecond
+
+	convoID := "conv-drain-bound"
+	// Write initial step so there is an update ready to be drained
+	newConversationDB(t, env.conversationsDir, convoID, []row{
+		{idx: 1, stepType: stepTypeText, payload: textPayload("initial step")},
+	})
+
+	var mu sync.Mutex
+	stepCount := 1
+	appendStep := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		stepCount++
+		dbPath := filepath.Join(env.conversationsDir, convoID+".db")
+		db, err := sql.Open("sqlite", writableDSN(dbPath))
+		if err != nil {
+			t.Errorf("opening db: %v", err)
+			return
+		}
+		defer db.Close()
+		_, err = db.Exec("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)",
+			stepCount, stepTypeText, textPayload(fmt.Sprintf("step %d", stepCount)))
+		if err != nil {
+			t.Errorf("inserting step: %v", err)
+		}
+	}
+
+	starter := func(ctx context.Context, argv []string) (agentProcess, error) {
+		return &scriptedAgent{
+			ctx:  ctx,
+			argv: argv,
+			script: func(ctx context.Context, args []string) error {
+				// Process exits cleanly immediately
+				return nil
+			},
+		}, nil
+	}
+
+	b := NewBridgeWithStarter(cfg, starter)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	turn, ok := b.registerTurn("sess-drain-bound", cancel)
+	if !ok {
+		t.Fatal("registerTurn failed")
+	}
+
+	sess := StoredSession{ConversationID: convoID, LastStepIdx: 0}
+
+	var activeEmits atomic.Int32
+	var overlapDetected atomic.Bool
+	var appended atomic.Bool
+
+	emit := func(u Update) error {
+		cur := activeEmits.Add(1)
+		if cur > 1 {
+			overlapDetected.Store(true)
+		}
+		defer activeEmits.Add(-1)
+
+		// On first emit during final drain, append another step into SQLite.
+		// If startPoller's ticker is still active (the bug), the poller ticker
+		// will fire (2ms ticker), poll the new step, and invoke emit concurrently
+		// while this emit is sleeping.
+		if appended.CompareAndSwap(false, true) {
+			appendStep()
+		}
+
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	}
+
+	outcome, err := b.runTurn(ctx, turn, "prompt", sess, emit)
+	if err != nil {
+		t.Fatalf("runTurn failed: %v", err)
+	}
+	if outcome.StopReason != StopReasonEndTurn {
+		t.Errorf("outcome.StopReason = %q, want %q", outcome.StopReason, StopReasonEndTurn)
+	}
+
+	if overlapDetected.Load() {
+		t.Fatalf("poll tick overlapped final drain: emit was invoked concurrently by multiple goroutines")
 	}
 }
