@@ -3,8 +3,10 @@ package session
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,4 +103,81 @@ func TestLockDiscipline(t *testing.T) {
 		t.Fatalf("AcquireLock 2 failed: %v", err)
 	}
 	_ = lock2.Release()
+}
+
+// TestAcquireLock_WaitVisibility pins the lock-wait visibility behavior
+// (bugs/wackyacp/lock-wait-visibility): while a flock is contended, AcquireLock
+// prints ONE waiting line to stderr (not one per 25ms tick), and after
+// acquiring prints an acquired-after-waiting line.
+func TestAcquireLock_WaitVisibility(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	lock1, err := AcquireLock(ctx, dir)
+	if err != nil {
+		t.Fatalf("AcquireLock 1 failed: %v", err)
+	}
+
+	// Capture stderr while the second lock waits.
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	var lock2 *Lock
+	done := make(chan struct{})
+	go func() {
+		var err error
+		lock2, err = AcquireLock(ctx, dir)
+		if err != nil {
+			t.Errorf("AcquireLock 2 failed: %v", err)
+		}
+		close(done)
+	}()
+
+	// Let the second lock spin on EWOULDBLOCK for a few ticks.
+	time.Sleep(150 * time.Millisecond)
+	_ = lock1.Release()
+	<-done
+	_ = w.Close()
+	os.Stderr = oldStderr
+	out, _ := io.ReadAll(r)
+	stderrText := string(out)
+
+	waitCount := strings.Count(stderrText, "waiting for acp-session.lock")
+	if waitCount != 1 {
+		t.Errorf("expected exactly 1 waiting line on stderr, got %d:\n%s", waitCount, stderrText)
+	}
+	if !strings.Contains(stderrText, "acquired lock on") {
+		t.Errorf("expected acquired-after-waiting line, got:\n%s", stderrText)
+	}
+	if lock2 != nil {
+		_ = lock2.Release()
+	}
+}
+
+// TestAcquireLock_CancelledWaitSentinel pins the sentinel on the cancel-during-wait
+// path so wackypub can classify lock-wait cancellation as superseded rather than a
+// bridge crash.
+func TestAcquireLock_CancelledWaitSentinel(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	lock1, err := AcquireLock(ctx, dir)
+	if err != nil {
+		t.Fatalf("AcquireLock 1 failed: %v", err)
+	}
+	defer lock1.Release()
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = AcquireLock(cancelCtx, dir)
+	if err == nil {
+		t.Fatal("expected contended AcquireLock to fail after cancel")
+	}
+	if !strings.Contains(err.Error(), "acp-session.lock contention") {
+		t.Errorf("expected contention sentinel in error, got: %v", err)
+	}
 }

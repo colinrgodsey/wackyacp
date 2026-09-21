@@ -48,9 +48,17 @@ func AcquireLock(ctx context.Context, agentFolder string) (*Lock, error) {
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 
+	// contended is set on the first EWOULDBLOCK so the wait-visibility line is printed ONCE
+	// instead of every 25ms tick - the caller (and any wrapper that captures stderr as
+	// diagnostic context) sees at most one line per acquisition.
+	contended := false
+
 	for {
 		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
+			if contended {
+				fmt.Fprintf(os.Stderr, "acp-session: acquired lock on %s after waiting\n", lockPath)
+			}
 			return &Lock{file: f, path: lockPath}, nil
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
@@ -58,10 +66,18 @@ func AcquireLock(ctx context.Context, agentFolder string) (*Lock, error) {
 			return nil, fmt.Errorf("locking %s: %w", lockPath, err)
 		}
 
+		if !contended {
+			contended = true
+			fmt.Fprintf(os.Stderr, "waiting for acp-session.lock on %s (held by another bridge)\n", lockPath)
+		}
+
 		select {
 		case <-ctx.Done():
 			_ = f.Close()
-			return nil, fmt.Errorf("acquiring lock on %s: %w", lockPath, ctx.Err())
+			// acp-session.lock contention sentinel: the caller (wackypub grpc_bridge_client
+			// translates bridge stderr) matches this to classify the exit as a superseded
+			// wait rather than a bridge crash.
+			return nil, fmt.Errorf("acquiring lock on %s (acp-session.lock contention, waited but ctx cancelled): %w", lockPath, ctx.Err())
 		case <-ticker.C:
 		}
 	}
