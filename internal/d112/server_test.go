@@ -287,3 +287,75 @@ func TestD112_AsideQuestion_Unsupported(t *testing.T) {
 		t.Fatalf("error should mention aside explicitly, got: %v", err)
 	}
 }
+
+// TestD112_SecondConcurrentTurnBusy pins the server-side half of
+// bugs/wackypub/bridge-concurrent-prompt-lock: a second prompt turn while one is
+// in flight on the same bridge process gets a structured ResourceExhausted error,
+// never a corrupted stream / died-bridge failure.
+func TestD112_SecondConcurrentTurnBusy(t *testing.T) {
+	release := make(chan struct{})
+	driver := &mockACPDriver{
+		chunks: []string{"first turn"},
+		promptHook: func(ctx context.Context) {
+			<-release
+		},
+	}
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	// Start turn 1; it blocks inside the driver prompt hook until released.
+	first, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "agent-test",
+		UserMessage: "hello one",
+	})
+	if err != nil {
+		t.Fatalf("first AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	// Allow the first stream to reach the in-flight region, then fire the second.
+	time.Sleep(50 * time.Millisecond)
+	second, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "agent-test",
+		UserMessage: "hello two",
+	})
+	if err == nil {
+		_, recvErr := second.Recv()
+		if recvErr == nil {
+			t.Fatal("expected second concurrent turn to be refused")
+		}
+		if status.Code(recvErr) != codes.ResourceExhausted {
+			t.Errorf("expected codes.ResourceExhausted on second concurrent turn, got: %v", recvErr)
+		}
+	}
+
+	// Release turn 1 and consume it normally.
+	close(release)
+	for {
+		_, recvErr := first.Recv()
+		if recvErr != nil {
+			if recvErr != io.EOF {
+				t.Fatalf("first turn stream error after release: %v", recvErr)
+			}
+			break
+		}
+	}
+
+	// After turn 1 completes, a fresh turn must succeed (slot released).
+	driver.promptHook = nil
+	third, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "agent-test",
+		UserMessage: "hello three",
+	})
+	if err != nil {
+		t.Fatalf("third AddAndGenerateTurnStream failed after turn 1: %v", err)
+	}
+	for {
+		_, recvErr := third.Recv()
+		if recvErr != nil {
+			if recvErr != io.EOF {
+				t.Fatalf("third turn stream error: %v", recvErr)
+			}
+			break
+		}
+	}
+}

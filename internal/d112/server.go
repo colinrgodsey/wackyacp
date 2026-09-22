@@ -28,6 +28,13 @@ type Server struct {
 	driver      ACPDriver
 	sessionID   string
 	agentFolder string
+
+	// turnMu + turnsInFlight serialize prompt turns served by THIS bridge process. The ACP
+	// harness runs one conversation at a time; a second concurrent prompt would collide on
+	// the driver session, so it is refused with a structured BUSY error instead of being
+	// let through to corrupt the stream (bugs/wackypub/bridge-concurrent-prompt-lock).
+	turnMu        sync.Mutex
+	turnsInFlight int
 }
 
 // NewServer constructs a new D112 Server backed by an ACP driver.
@@ -37,6 +44,28 @@ func NewServer(driver ACPDriver, sessionID, agentFolder string) *Server {
 		sessionID:   sessionID,
 		agentFolder: agentFolder,
 	}
+}
+
+// beginTurn reserves the single in-flight slot. Returns false if another turn is active.
+func (s *Server) beginTurn() bool {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turnsInFlight > 0 {
+		return false
+	}
+	s.turnsInFlight++
+	return true
+}
+
+// endTurn releases the in-flight slot.
+func (s *Server) endTurn() {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	s.turnsInFlight--
+}
+
+func errTurnBusy() error {
+	return status.Error(codes.ResourceExhausted, "another prompt turn is already in flight for this agent; retry after it completes")
 }
 
 func toProtoUsage(u acp.UsageMetrics) *agentv1.TurnUsage {
@@ -75,6 +104,10 @@ func translateError(err error) error {
 }
 
 func (s *Server) GenerateTurnStream(req *agentv1.GenerateTurnStreamRequest, stream agentv1.AgentService_GenerateTurnStreamServer) error {
+	if !s.beginTurn() {
+		return errTurnBusy()
+	}
+	defer s.endTurn()
 	ctx := stream.Context()
 	defer func() {
 		if ctx.Err() != nil {
@@ -113,6 +146,10 @@ func (s *Server) GenerateTurnStream(req *agentv1.GenerateTurnStreamRequest, stre
 }
 
 func (s *Server) AddAndGenerateTurnStream(req *agentv1.AddAndGenerateTurnStreamRequest, stream agentv1.AgentService_AddAndGenerateTurnStreamServer) error {
+	if !s.beginTurn() {
+		return errTurnBusy()
+	}
+	defer s.endTurn()
 	ctx := stream.Context()
 	defer func() {
 		if ctx.Err() != nil {
@@ -152,6 +189,10 @@ func (s *Server) AddAndGenerateTurnStream(req *agentv1.AddAndGenerateTurnStreamR
 }
 
 func (s *Server) GenerateTurn(ctx context.Context, req *agentv1.GenerateTurnRequest) (*agentv1.GenerateTurnResponse, error) {
+	if !s.beginTurn() {
+		return nil, errTurnBusy()
+	}
+	defer s.endTurn()
 	defer func() {
 		if ctx.Err() != nil {
 			_ = s.driver.Cancel(s.sessionID)
@@ -178,6 +219,10 @@ func (s *Server) GenerateTurn(ctx context.Context, req *agentv1.GenerateTurnRequ
 }
 
 func (s *Server) AddAndGenerateTurn(ctx context.Context, req *agentv1.AddAndGenerateTurnRequest) (*agentv1.AddAndGenerateTurnResponse, error) {
+	if !s.beginTurn() {
+		return nil, errTurnBusy()
+	}
+	defer s.endTurn()
 	defer func() {
 		if ctx.Err() != nil {
 			_ = s.driver.Cancel(s.sessionID)
