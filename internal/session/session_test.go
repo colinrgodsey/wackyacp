@@ -153,31 +153,3 @@ func TestAcquireLock_WaitVisibility(t *testing.T) {
 		_ = lock2.Release()
 	}
 }
-
-// TestAcquireLock_CancelledWaitSentinel pins the sentinel on the cancel-during-wait
-// path so wackypub can classify lock-wait cancellation as superseded rather than a
-// bridge crash.
-func TestAcquireLock_CancelledWaitSentinel(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-
-	lock1, err := AcquireLock(ctx, dir)
-	if err != nil {
-		t.Fatalf("AcquireLock 1 failed: %v", err)
-	}
-	defer lock1.Release()
-
-	cancelCtx, cancel := context.WithCancel(ctx)
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-
-	_, err = AcquireLock(cancelCtx, dir)
-	if err == nil {
-		t.Fatal("expected contended AcquireLock to fail after cancel")
-	}
-	if !strings.Contains(err.Error(), "acp-session.lock contention") {
-		t.Errorf("expected contention sentinel in error, got: %v", err)
-	}
-}

@@ -74,10 +74,7 @@ func AcquireLock(ctx context.Context, agentFolder string) (*Lock, error) {
 		select {
 		case <-ctx.Done():
 			_ = f.Close()
-			// acp-session.lock contention sentinel: the caller (wackypub grpc_bridge_client
-			// translates bridge stderr) matches this to classify the exit as a superseded
-			// wait rather than a bridge crash.
-			return nil, fmt.Errorf("acquiring lock on %s (acp-session.lock contention, waited but ctx cancelled): %w", lockPath, ctx.Err())
+			return nil, fmt.Errorf("acquiring lock on %s: %w", lockPath, ctx.Err())
 		case <-ticker.C:
 		}
 	}
