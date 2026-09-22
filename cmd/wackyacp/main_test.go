@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -464,4 +465,141 @@ func TestE2E_HarnessIgnoreEOF_ExitsWithinWaitDelay(t *testing.T) {
 	case <-time.After(8 * time.Second):
 		t.Fatalf("wackyacp failed to exit within WaitDelay bounds when harness ignored EOF")
 	}
+}
+
+// TestE2E_ConcurrentDispatches_WaitThenSucceed re-verifies the
+// bugs/wackyacp/lock-wait-visibility diagnosis end-to-end: D117 has an exclusive
+// flock on acp-session.lock already serializes two concurrent bridge processes.
+// The second blocks in AcquireLock at process start (observable via the
+// "waiting for" stderr line once) and proceeds after the first bridge process
+// exits - NOT corruption.
+func TestE2E_ConcurrentDispatches_WaitThenSucceed(t *testing.T) {
+	agentFolder := t.TempDir()
+	wackyacpBin := getWackyacpBin(t)
+	shimBin := getShimBin(t)
+
+	// Bridge 1: hold-turn keeps the shim alive ~1s so the flock is observably held.
+	// The flock is held for the whole bridge PROCESS lifetime (released when the
+	// process exits, i.e. when its stdin EOFs via conn close).
+	cmd1 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=hold-turn")
+	cmd1.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	stdin1, _ := cmd1.StdinPipe()
+	stdout1, _ := cmd1.StdoutPipe()
+	if err := cmd1.Start(); err != nil {
+		t.Fatalf("start bridge1: %v", err)
+	}
+	conn1 := &stdioConn{stdin: stdin1, stdout: stdout1, cmd: cmd1}
+	g1, _ := grpc.NewClient("passthrough:///w1", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn1, nil }))
+	client1 := agentv1.NewAgentServiceClient(g1)
+
+	// Fire bridge1 turn; it blocks ~1s in the shim holding the lock.
+	turn1Done := make(chan struct{})
+	go func() {
+		stream, err := client1.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{AgentId: "agent-a", UserMessage: "first"})
+		if err != nil {
+			t.Errorf("turn1 stream open failed: %v", err)
+			return
+		}
+		for {
+			_, rerr := stream.Recv()
+			if rerr != nil {
+				close(turn1Done)
+				return
+			}
+		}
+	}()
+
+	// Let bridge1 acquire the lock and get into its held turn.
+	time.Sleep(300 * time.Millisecond)
+
+	// Bridge 2 on the SAME agent folder: blocks in AcquireLock at startup; the D112
+	// server (and therefore the grpc handshake) only comes up after the lock is free.
+	stderrGuard := &guardBuffer{mu: &stderrMu, buf: &stderr2}
+	cmd2 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=normal")
+	cmd2.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd2.Stderr = stderrGuard
+	stdin2, _ := cmd2.StdinPipe()
+	stdout2, _ := cmd2.StdoutPipe()
+	if err := cmd2.Start(); err != nil {
+		t.Fatalf("start bridge2: %v", err)
+	}
+	conn2 := &stdioConn{stdin: stdin2, stdout: stdout2, cmd: cmd2}
+	g2, _ := grpc.NewClient("passthrough:///w2", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn2, nil }))
+	client2 := agentv1.NewAgentServiceClient(g2)
+	defer func() { _ = g2.Close(); _ = conn2.Close() }()
+
+	// Turn2 in a goroutine: grpc lazy-connect blocks until bridge2 acquires the lock
+	// (i.e. until bridge1 exits), then succeeds.
+	turn2Err := make(chan error, 1)
+	turn2Start := time.Now()
+	go func() {
+		stream, err := client2.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{AgentId: "agent-a", UserMessage: "second"})
+		if err != nil {
+			turn2Err <- err
+			return
+		}
+		for {
+			_, rerr := stream.Recv()
+			if rerr != nil {
+				turn2Err <- nil
+				return
+			}
+		}
+	}()
+
+	// Give bridge2 time to reach the lock-wait loop and print the visibility line.
+	time.Sleep(300 * time.Millisecond)
+	stderrMu.Lock()
+	stderrSnapshot := stderr2.String()
+	stderrMu.Unlock()
+	if !strings.Contains(stderrSnapshot, "waiting for acp-session.lock") {
+		t.Errorf("expected lock-wait visibility on stderr, got:\n%s", stderrText())
+	}
+
+	// Wait for turn1 to finish, then tear down bridge1 (close conn, stdin EOF, process
+	// exit, flock release), which unblocks bridge2.
+	select {
+	case <-turn1Done:
+		_ = g1.Close()
+		_ = conn1.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn1 never completed")
+	}
+
+	// Turn2 must now complete successfully (wait-then-succeed).
+	select {
+	case err := <-turn2Err:
+		if err != nil {
+			t.Fatalf("turn2 failed: %v (stderr:\n%s)", err, stderrText())
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("turn2 never completed after bridge1 exited")
+	}
+	if time.Since(turn2Start) < 300*time.Millisecond {
+		t.Errorf("turn2 did not appear to wait for the lock (elapsed %v)", time.Since(turn2Start))
+	}
+}
+
+// stderrMu and stderr2 guard the captured stderr of the second bridge in the concurrent
+// dispatch test; the exec goroutine writes while the test reads (race detector enforced).
+var stderrMu sync.Mutex
+var stderr2 bytes.Buffer
+
+// guardBuffer is a mutex-guarded io.Writer over a bytes.Buffer for capturing
+// subprocess stderr without racing the reader.
+type guardBuffer struct {
+	mu  *sync.Mutex
+	buf *bytes.Buffer
+}
+
+func stderrText() string {
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
+	return stderr2.String()
+}
+
+func (g *guardBuffer) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.buf.Write(p)
 }

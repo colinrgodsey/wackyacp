@@ -305,6 +305,25 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 				},
 			})
 
+		case "hold-turn":
+			// Hold the turn (and therefore the shim process, and therefore wackyacp's
+			// acp-session.lock flock) for ~1s so a concurrently-started second bridge has
+			// time to observe lock contention.
+			time.Sleep(1 * time.Second)
+			_ = s.sendNotification("session/update", map[string]any{
+				"sessionId": params.SessionID,
+				"update": map[string]any{
+					"sessionUpdate": "agent_message_chunk",
+					"content": map[string]any{
+						"type": "text",
+						"text": "held: " + promptText,
+					},
+				},
+			})
+			return s.sendResult(msg.ID, map[string]any{
+				"stopReason": "end_turn",
+			})
+
 		case "resume-ok":
 			_ = s.sendNotification("session/update", map[string]any{
 				"sessionId": params.SessionID,
