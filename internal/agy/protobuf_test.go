@@ -221,7 +221,7 @@ func TestStepTypeClassification(t *testing.T) {
 	if isTextStepType(5) || isToolStepType(stepTypeText) {
 		t.Fatal("text and tool step types overlap")
 	}
-	for _, toolType := range []int64{5, 7, 8, 9, 17, 21, 33, 101, 138} {
+	for _, toolType := range []int64{5, 7, 8, 9, 17, 21, 33, 101, 132, 138} {
 		if !isToolStepType(toolType) {
 			t.Fatalf("tool step type %d not recognised", toolType)
 		}

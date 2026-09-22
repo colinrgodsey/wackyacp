@@ -220,8 +220,8 @@ func (p *TurnPoller) toolUpdates(step Step) []Update {
 	id := fmt.Sprintf("agy-%d-%d", step.Idx, step.StepType)
 	title := toolCallTitle(call.Name, call.Input)
 	return []Update{
-		{SessionUpdate: updateToolCall, ToolCallID: id, Title: title, RawInput: call.Input},
-		{SessionUpdate: updateToolDone, ToolCallID: id, Title: title, Status: "completed"},
+		{SessionUpdate: updateToolCall, ToolCallID: id, ToolName: call.Name, Title: title, RawInput: call.Input},
+		{SessionUpdate: updateToolDone, ToolCallID: id, ToolName: call.Name, Title: title, Status: "completed"},
 	}
 }
 

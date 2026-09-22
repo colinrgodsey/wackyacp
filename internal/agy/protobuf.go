@@ -156,7 +156,7 @@ const stepTypeText int64 = 15
 
 // toolStepTypes are the agy step types that represent a tool invocation.
 var toolStepTypes = map[int64]bool{
-	5: true, 7: true, 8: true, 9: true, 17: true, 21: true, 33: true, 101: true, 138: true,
+	5: true, 7: true, 8: true, 9: true, 17: true, 21: true, 33: true, 101: true, 132: true, 138: true,
 }
 
 // isToolStepType reports whether a step row represents a tool invocation.

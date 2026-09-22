@@ -182,6 +182,9 @@ func TestPollerAdvancesAcrossRows(t *testing.T) {
 	if updates[1].Title != "read_file: /p" || updates[2].Status != "completed" {
 		t.Fatalf("tool pair = %+v, %+v", updates[1], updates[2])
 	}
+	if updates[1].ToolName != "read_file" || updates[2].ToolName != "read_file" {
+		t.Fatalf("tool names = %q / %q, want read_file", updates[1].ToolName, updates[2].ToolName)
+	}
 	if string(updates[1].RawInput) != `{"path":"/p"}` {
 		t.Fatalf("rawInput = %s", updates[1].RawInput)
 	}
