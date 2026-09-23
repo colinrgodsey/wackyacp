@@ -126,6 +126,16 @@ func (s *Server) GenerateTurnStream(req *agentv1.GenerateTurnStreamRequest, stre
 			// GenerateTurnStreamResponse has no warning field; nothing to send directly
 			return nil
 		},
+		OnToolCall: func(call *agentv1.ToolCall) error {
+			return stream.Send(&agentv1.GenerateTurnStreamResponse{
+				ToolCall: call,
+			})
+		},
+		OnToolCallUpdate: func(update *agentv1.ToolCallUpdate) error {
+			return stream.Send(&agentv1.GenerateTurnStreamResponse{
+				ToolCallUpdate: update,
+			})
+		},
 	}
 
 	res, err := s.driver.Prompt(ctx, s.sessionID, promptText, callbacks)
@@ -167,6 +177,16 @@ func (s *Server) AddAndGenerateTurnStream(req *agentv1.AddAndGenerateTurnStreamR
 		OnWarning: func(warning string) error {
 			return stream.Send(&agentv1.AddAndGenerateTurnStreamResponse{
 				Warning: warning,
+			})
+		},
+		OnToolCall: func(call *agentv1.ToolCall) error {
+			return stream.Send(&agentv1.AddAndGenerateTurnStreamResponse{
+				ToolCall: call,
+			})
+		},
+		OnToolCallUpdate: func(update *agentv1.ToolCallUpdate) error {
+			return stream.Send(&agentv1.AddAndGenerateTurnStreamResponse{
+				ToolCallUpdate: update,
 			})
 		},
 	}

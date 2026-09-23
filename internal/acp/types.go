@@ -100,9 +100,31 @@ type PermissionRequestParams struct {
 }
 
 type ToolCallInfo struct {
-	ToolCallID string `json:"toolCallId"`
-	Title      string `json:"title,omitempty"`
-	Kind       string `json:"kind,omitempty"`
+	ToolCallID string          `json:"toolCallId"`
+	ToolName   string          `json:"toolName,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	Title      string          `json:"title,omitempty"`
+	Kind       string          `json:"kind,omitempty"`
+	RawInput   json.RawMessage `json:"rawInput,omitempty"`
+	Input      json.RawMessage `json:"input,omitempty"`
+	Args       json.RawMessage `json:"args,omitempty"`
+	Arguments  json.RawMessage `json:"arguments,omitempty"`
+}
+
+func (t *ToolCallInfo) inputPayload() json.RawMessage {
+	if len(t.RawInput) > 0 {
+		return t.RawInput
+	}
+	if len(t.Input) > 0 {
+		return t.Input
+	}
+	if len(t.Args) > 0 {
+		return t.Args
+	}
+	if len(t.Arguments) > 0 {
+		return t.Arguments
+	}
+	return nil
 }
 
 type PermissionOption struct {

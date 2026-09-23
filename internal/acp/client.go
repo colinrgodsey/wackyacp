@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/colinrgodsey/wackyacp/internal/session"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 var (
@@ -21,10 +22,12 @@ var (
 	ErrSessionMismatch = errors.New("session ownership assertion failed")
 )
 
-// TurnCallbacks receives streamed text deltas and warnings during a prompt turn.
+// TurnCallbacks receives streamed text deltas, warnings, and tool events during a prompt turn.
 type TurnCallbacks struct {
-	OnChunk   func(text string) error
-	OnWarning func(warning string) error
+	OnChunk          func(text string) error
+	OnWarning        func(warning string) error
+	OnToolCall       func(*agentv1.ToolCall) error
+	OnToolCallUpdate func(*agentv1.ToolCallUpdate) error
 }
 
 type activeTurn struct {
@@ -266,15 +269,40 @@ func (c *Client) handleIncomingRequest(line []byte) {
 				}
 			}
 
-			if turn := c.activeTurnRef(); turn != nil && turn.callbacks.OnWarning != nil {
+			if turn := c.activeTurnRef(); turn != nil {
 				title := params.ToolCall.Title
 				if title == "" {
 					title = params.ToolCall.ToolCallID
 				}
 				if chosenOptionID != "" {
-					_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", title))
+					if turn.callbacks.OnWarning != nil {
+						_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approved: %s", title))
+					}
 				} else {
-					_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approve failed (no allow option matched): %s", title))
+					callID := params.ToolCall.ToolCallID
+					if callID == "" {
+						callID = newToolCallID()
+					}
+					toolName := extractToolName(params.ToolCall.ToolName, params.ToolCall.Name, params.ToolCall.Title, params.ToolCall.Kind)
+					argsSummary := buildArgsSummary(params.ToolCall.inputPayload(), params.ToolCall.Title)
+					if turn.callbacks.OnToolCall != nil {
+						_ = turn.callbacks.OnToolCall(&agentv1.ToolCall{
+							CallId:      callID,
+							ToolName:    toolName,
+							ArgsSummary: argsSummary,
+							Denied:      true,
+						})
+					}
+					if turn.callbacks.OnToolCallUpdate != nil {
+						_ = turn.callbacks.OnToolCallUpdate(&agentv1.ToolCallUpdate{
+							CallId:   callID,
+							ToolName: toolName,
+							Status:   ToolStatusDenied,
+						})
+					}
+					if turn.callbacks.OnWarning != nil {
+						_ = turn.callbacks.OnWarning(fmt.Sprintf("permission auto-approve failed (no allow option matched): %s", title))
+					}
 				}
 			}
 			break
@@ -301,8 +329,34 @@ func (c *Client) handleIncomingRequest(line []byte) {
 			}
 		}
 
-		// Surface warning over D112
+		callID := params.ToolCall.ToolCallID
+		if callID == "" {
+			callID = newToolCallID()
+		}
+		toolName := extractToolName(params.ToolCall.ToolName, params.ToolCall.Name, params.ToolCall.Title, params.ToolCall.Kind)
+		argsSummary := buildArgsSummary(params.ToolCall.inputPayload(), params.ToolCall.Title)
+
+		// Surface tool call and update over D112 with denied status
 		turn := c.activeTurnRef()
+		if turn != nil {
+			if turn.callbacks.OnToolCall != nil {
+				_ = turn.callbacks.OnToolCall(&agentv1.ToolCall{
+					CallId:      callID,
+					ToolName:    toolName,
+					ArgsSummary: argsSummary,
+					Denied:      true,
+				})
+			}
+			if turn.callbacks.OnToolCallUpdate != nil {
+				_ = turn.callbacks.OnToolCallUpdate(&agentv1.ToolCallUpdate{
+					CallId:   callID,
+					ToolName: toolName,
+					Status:   ToolStatusDenied,
+				})
+			}
+		}
+
+		// Surface warning over D112
 		if turn != nil && turn.callbacks.OnWarning != nil {
 			title := params.ToolCall.Title
 			if title == "" {
@@ -492,6 +546,24 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		defer turn.mu.Unlock()
 		if update.Used > 0 {
 			turn.usage.TotalTokens = update.Used
+		}
+
+	case UpdateKindToolCall:
+		var raw rawToolUpdate
+		if err := json.Unmarshal(params.Update, &raw); err == nil {
+			if turn.callbacks.OnToolCall != nil {
+				call := mapToolCall(&raw)
+				_ = turn.callbacks.OnToolCall(call)
+			}
+		}
+
+	case UpdateKindToolCallUpdate:
+		var raw rawToolUpdate
+		if err := json.Unmarshal(params.Update, &raw); err == nil {
+			if turn.callbacks.OnToolCallUpdate != nil {
+				tcUpdate := mapToolCallUpdate(&raw)
+				_ = turn.callbacks.OnToolCallUpdate(tcUpdate)
+			}
 		}
 
 	default:

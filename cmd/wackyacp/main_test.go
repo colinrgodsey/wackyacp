@@ -917,6 +917,62 @@ func TestE2E_ProcessHygiene_SimulatedFailure(t *testing.T) {
 	})
 }
 
+func TestWackyacp_E2E_ToolCallStreaming(t *testing.T) {
+	agentFolder := newTestAgentFolder(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, cleanup := spawnBridge(t, ctx, agentFolder, "tool-calls")
+	defer cleanup()
+
+	stream, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "agent-test",
+		UserMessage: "run tool",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	var textChunks []string
+	var toolCalls []*agentv1.ToolCall
+	var toolCallUpdates []*agentv1.ToolCallUpdate
+
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("stream.Recv failed: %v", err)
+		}
+		if resp.Text != "" {
+			textChunks = append(textChunks, resp.Text)
+		}
+		if resp.ToolCall != nil {
+			toolCalls = append(toolCalls, resp.ToolCall)
+		}
+		if resp.ToolCallUpdate != nil {
+			toolCallUpdates = append(toolCallUpdates, resp.ToolCallUpdate)
+		}
+	}
+
+	if len(textChunks) != 2 || textChunks[0] != "calling tool" || textChunks[1] != "tool call finished" {
+		t.Errorf("unexpected text chunks: %v", textChunks)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 ToolCall, got %d", len(toolCalls))
+	}
+	if toolCalls[0].CallId != "call-e2e-1" || toolCalls[0].ToolName != "bash" || toolCalls[0].ArgsSummary != "command=echo hello" {
+		t.Errorf("unexpected ToolCall: %+v", toolCalls[0])
+	}
+	if len(toolCallUpdates) != 1 {
+		t.Fatalf("expected 1 ToolCallUpdate, got %d", len(toolCallUpdates))
+	}
+	if toolCallUpdates[0].CallId != "call-e2e-1" || toolCallUpdates[0].Status != "completed" || toolCallUpdates[0].ResultHead != "hello\n" {
+		t.Errorf("unexpected ToolCallUpdate: %+v", toolCallUpdates[0])
+	}
+}
+
 func TestZZZ_Canary_NoOrphanProcesses(t *testing.T) {
 	// Assert no stray wackyacp or harness processes tagged with e2eMarker remain after the suite
 	strays, err := sweepProcesses(e2eMarker)

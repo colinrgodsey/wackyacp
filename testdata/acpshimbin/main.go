@@ -269,6 +269,59 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 				"stopReason": "end_turn",
 			})
 
+		case "tool-calls":
+			// Send text chunk before tool
+			_ = s.sendNotification("session/update", map[string]any{
+				"sessionId": params.SessionID,
+				"update": map[string]any{
+					"sessionUpdate": "agent_message_chunk",
+					"content": map[string]any{
+						"type": "text",
+						"text": "calling tool",
+					},
+				},
+			})
+
+			// Send tool_call notification
+			_ = s.sendNotification("session/update", map[string]any{
+				"sessionId": params.SessionID,
+				"update": map[string]any{
+					"sessionUpdate": "tool_call",
+					"toolCallId":    "call-e2e-1",
+					"toolName":      "bash",
+					"rawInput":      map[string]any{"command": "echo hello"},
+					"status":        "in_progress",
+				},
+			})
+
+			// Send tool_call_update notification
+			_ = s.sendNotification("session/update", map[string]any{
+				"sessionId": params.SessionID,
+				"update": map[string]any{
+					"sessionUpdate": "tool_call_update",
+					"toolCallId":    "call-e2e-1",
+					"toolName":      "bash",
+					"status":        "completed",
+					"rawOutput":     "hello\n",
+				},
+			})
+
+			// Send text chunk after tool
+			_ = s.sendNotification("session/update", map[string]any{
+				"sessionId": params.SessionID,
+				"update": map[string]any{
+					"sessionUpdate": "agent_message_chunk",
+					"content": map[string]any{
+						"type": "text",
+						"text": "tool call finished",
+					},
+				},
+			})
+
+			return s.sendResult(msg.ID, map[string]any{
+				"stopReason": "end_turn",
+			})
+
 		case "emit-usage":
 			// Send text chunk
 			_ = s.sendNotification("session/update", map[string]any{

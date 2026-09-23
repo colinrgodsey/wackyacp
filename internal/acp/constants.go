@@ -21,6 +21,15 @@ const (
 	UpdateKindToolCallUpdate    = "tool_call_update"
 )
 
+// ACP tool execution statuses (mirroring ACP spec).
+const (
+	ToolStatusPending    = "pending"
+	ToolStatusInProgress = "in_progress"
+	ToolStatusCompleted  = "completed"
+	ToolStatusFailed     = "failed"
+	ToolStatusDenied     = "denied"
+)
+
 // ACP permission option kinds.
 const (
 	OptionKindAllowOnce    = "allow_once"

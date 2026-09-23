@@ -16,6 +16,7 @@ import (
 
 	"github.com/colinrgodsey/wackyacp/internal/harness"
 	"github.com/colinrgodsey/wackyacp/internal/session"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 var (
@@ -275,6 +276,8 @@ func TestClient_Prompt_AutoDenyPermission(t *testing.T) {
 
 	var chunks []string
 	var warnings []string
+	var toolCalls []*agentv1.ToolCall
+	var toolCallUpdates []*agentv1.ToolCallUpdate
 	callbacks := TurnCallbacks{
 		OnChunk: func(text string) error {
 			chunks = append(chunks, text)
@@ -282,6 +285,14 @@ func TestClient_Prompt_AutoDenyPermission(t *testing.T) {
 		},
 		OnWarning: func(w string) error {
 			warnings = append(warnings, w)
+			return nil
+		},
+		OnToolCall: func(tc *agentv1.ToolCall) error {
+			toolCalls = append(toolCalls, tc)
+			return nil
+		},
+		OnToolCallUpdate: func(tcu *agentv1.ToolCallUpdate) error {
+			toolCallUpdates = append(toolCallUpdates, tcu)
 			return nil
 		},
 	}
@@ -308,6 +319,20 @@ func TestClient_Prompt_AutoDenyPermission(t *testing.T) {
 	}
 	if !foundDenyWarning {
 		t.Errorf("expected auto-deny warning, got: %v", warnings)
+	}
+
+	// Verify that denied tool call and update were emitted
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 ToolCall, got %d", len(toolCalls))
+	}
+	if toolCalls[0].CallId != "call-1" || !toolCalls[0].Denied {
+		t.Errorf("expected denied ToolCall with callId call-1, got: %+v", toolCalls[0])
+	}
+	if len(toolCallUpdates) != 1 {
+		t.Fatalf("expected 1 ToolCallUpdate, got %d", len(toolCallUpdates))
+	}
+	if toolCallUpdates[0].CallId != "call-1" || toolCallUpdates[0].Status != ToolStatusDenied {
+		t.Errorf("expected denied ToolCallUpdate with callId call-1, got: %+v", toolCallUpdates[0])
 	}
 
 	// Verify that the shim got the deny response and reported the outcome
@@ -999,5 +1024,91 @@ func TestClient_Prompt_ResponseDecodeError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decoding session/prompt response") {
 		t.Errorf("expected error message to mention decoding session/prompt response, got: %v", err)
+	}
+}
+
+func TestClient_ToolCallEventsAndFlushOrder(t *testing.T) {
+	client, harness, cleanup := newPipeMockHarness(t)
+	defer cleanup()
+
+	var events []string
+	var mu sync.Mutex
+	record := func(ev string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, ev)
+	}
+
+	callbacks := TurnCallbacks{
+		OnChunk: func(text string) error {
+			record("chunk:" + text)
+			return nil
+		},
+		OnToolCall: func(call *agentv1.ToolCall) error {
+			record(fmt.Sprintf("tool_call:%s:%s:%s", call.CallId, call.ToolName, call.ArgsSummary))
+			return nil
+		},
+		OnToolCallUpdate: func(update *agentv1.ToolCallUpdate) error {
+			record(fmt.Sprintf("tool_call_update:%s:%s:%s", update.CallId, update.ToolName, update.Status))
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, id := harness.readRequest()
+
+		// 1. Buffered text chunk before tool call
+		harness.sendChunk("sess-tc", "pre-tool text")
+
+		// 2. Tool call arrives (must flush "pre-tool text" first!)
+		harness.sendUpdate("sess-tc", map[string]any{
+			"sessionUpdate": "tool_call",
+			"toolCallId":    "call-abc",
+			"toolName":      "bash",
+			"rawInput":      map[string]any{"command": "echo 123"},
+			"status":        "in_progress",
+		})
+
+		// 3. Tool call update arrives
+		harness.sendUpdate("sess-tc", map[string]any{
+			"sessionUpdate": "tool_call_update",
+			"toolCallId":    "call-abc",
+			"toolName":      "bash",
+			"status":        "completed",
+			"rawOutput":     "123\n",
+		})
+
+		// 4. Post-tool text chunk
+		harness.sendChunk("sess-tc", "post-tool text")
+
+		harness.sendPromptResponse(id, "end_turn")
+	}()
+
+	res, err := client.Prompt(context.Background(), "sess-tc", "test prompt", callbacks)
+	<-done
+	if err != nil {
+		t.Fatalf("Prompt failed: %v", err)
+	}
+	if res.StopReason != "end_turn" {
+		t.Errorf("expected end_turn, got: %s", res.StopReason)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantEvents := []string{
+		"chunk:pre-tool text",
+		"tool_call:call-abc:bash:command=echo 123",
+		"tool_call_update:call-abc:bash:completed",
+		"chunk:post-tool text",
+	}
+	if len(events) != len(wantEvents) {
+		t.Fatalf("got events %v, want %v", events, wantEvents)
+	}
+	for i, want := range wantEvents {
+		if events[i] != want {
+			t.Errorf("event[%d] = %q, want %q", i, events[i], want)
+		}
 	}
 }

@@ -20,6 +20,7 @@ type Update struct {
 	SessionUpdate string          `json:"sessionUpdate"`
 	Content       *Content        `json:"content,omitempty"`
 	ToolCallID    string          `json:"toolCallId,omitempty"`
+	ToolName      string          `json:"toolName,omitempty"`
 	Title         string          `json:"title,omitempty"`
 	RawInput      json.RawMessage `json:"rawInput,omitempty"`
 	Status        string          `json:"status,omitempty"`

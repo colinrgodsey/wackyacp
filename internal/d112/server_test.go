@@ -21,6 +21,8 @@ import (
 type mockACPDriver struct {
 	chunks            []string
 	warnings          []string
+	toolCalls         []*agentv1.ToolCall
+	toolCallUpdates   []*agentv1.ToolCallUpdate
 	usage             acp.UsageMetrics
 	err               error
 	promptHook        func(ctx context.Context)
@@ -41,6 +43,16 @@ func (m *mockACPDriver) Prompt(ctx context.Context, sessionID, promptText string
 	for _, c := range m.chunks {
 		if callbacks.OnChunk != nil {
 			_ = callbacks.OnChunk(c)
+		}
+	}
+	for _, tc := range m.toolCalls {
+		if callbacks.OnToolCall != nil {
+			_ = callbacks.OnToolCall(tc)
+		}
+	}
+	for _, tcu := range m.toolCallUpdates {
+		if callbacks.OnToolCallUpdate != nil {
+			_ = callbacks.OnToolCallUpdate(tcu)
 		}
 	}
 	for _, w := range m.warnings {
@@ -358,4 +370,93 @@ func TestD112_SecondConcurrentTurnBusy(t *testing.T) {
 			break
 		}
 	}
+}
+
+func TestD112_ToolCallStreaming(t *testing.T) {
+	tc := &agentv1.ToolCall{
+		CallId:      "tc-1",
+		ToolName:    "bash",
+		ArgsSummary: "command=ls",
+	}
+	tcu := &agentv1.ToolCallUpdate{
+		CallId:      "tc-1",
+		ToolName:    "bash",
+		Status:      "completed",
+		ResultBytes: 10,
+		ResultHead:  "output",
+	}
+
+	driver := &mockACPDriver{
+		chunks:          []string{"Calling tool..."},
+		toolCalls:       []*agentv1.ToolCall{tc},
+		toolCallUpdates: []*agentv1.ToolCallUpdate{tcu},
+	}
+
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	t.Run("GenerateTurnStream", func(t *testing.T) {
+		stream, err := client.GenerateTurnStream(context.Background(), &agentv1.GenerateTurnStreamRequest{
+			AgentId: "agent-test",
+		})
+		if err != nil {
+			t.Fatalf("GenerateTurnStream failed: %v", err)
+		}
+		var gotCall *agentv1.ToolCall
+		var gotUpdate *agentv1.ToolCallUpdate
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				t.Fatalf("Recv failed: %v", err)
+			}
+			if resp.ToolCall != nil {
+				gotCall = resp.ToolCall
+			}
+			if resp.ToolCallUpdate != nil {
+				gotUpdate = resp.ToolCallUpdate
+			}
+		}
+		if gotCall == nil || gotCall.CallId != "tc-1" || gotCall.ToolName != "bash" {
+			t.Errorf("unexpected ToolCall: %+v", gotCall)
+		}
+		if gotUpdate == nil || gotUpdate.CallId != "tc-1" || gotUpdate.Status != "completed" {
+			t.Errorf("unexpected ToolCallUpdate: %+v", gotUpdate)
+		}
+	})
+
+	t.Run("AddAndGenerateTurnStream", func(t *testing.T) {
+		stream, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+			AgentId:     "agent-test",
+			UserMessage: "run",
+		})
+		if err != nil {
+			t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+		}
+		var gotCall *agentv1.ToolCall
+		var gotUpdate *agentv1.ToolCallUpdate
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				t.Fatalf("Recv failed: %v", err)
+			}
+			if resp.ToolCall != nil {
+				gotCall = resp.ToolCall
+			}
+			if resp.ToolCallUpdate != nil {
+				gotUpdate = resp.ToolCallUpdate
+			}
+		}
+		if gotCall == nil || gotCall.CallId != "tc-1" || gotCall.ToolName != "bash" {
+			t.Errorf("unexpected ToolCall: %+v", gotCall)
+		}
+		if gotUpdate == nil || gotUpdate.CallId != "tc-1" || gotUpdate.Status != "completed" {
+			t.Errorf("unexpected ToolCallUpdate: %+v", gotUpdate)
+		}
+	})
 }
