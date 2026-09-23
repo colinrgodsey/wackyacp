@@ -75,6 +75,9 @@ func TestHarnessCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = proc.Close()
+	})
 
 	// Cancel context to trigger process-group termination
 	time.Sleep(50 * time.Millisecond)
@@ -98,6 +101,9 @@ func TestHarnessIgnoreEOF_CloseEscalatesKill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = proc.Close()
+	})
 
 	start := time.Now()
 	done := make(chan error, 1)

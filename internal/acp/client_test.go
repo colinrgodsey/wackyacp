@@ -51,6 +51,10 @@ func startShimClient(t *testing.T, script string) (*Client, *harness.Process) {
 		t.Fatalf("starting shim failed: %v", err)
 	}
 
+	t.Cleanup(func() {
+		_ = proc.Close()
+	})
+
 	client := NewClient(proc.Stdin, proc.Stdout)
 	return client, proc
 }
