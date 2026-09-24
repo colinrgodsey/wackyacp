@@ -19,6 +19,7 @@ import (
 
 	"github.com/colinrgodsey/wackyacp/internal/session"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
+	"github.com/colinrgodsey/wackypub/pkg/stdio"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -76,81 +77,6 @@ func getShimBin(t *testing.T) string {
 	return shimBinPath
 }
 
-type stdioConn struct {
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	cmd       *exec.Cmd
-	waitDelay time.Duration
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func (c *stdioConn) Read(b []byte) (int, error)  { return c.stdout.Read(b) }
-func (c *stdioConn) Write(b []byte) (int, error) { return c.stdin.Write(b) }
-func (c *stdioConn) Close() error {
-	c.closeOnce.Do(func() {
-		var inErr, outErr error
-		if c.stdin != nil {
-			inErr = c.stdin.Close()
-		}
-		if c.stdout != nil {
-			outErr = c.stdout.Close()
-		}
-
-		waitDone := make(chan error, 1)
-		go func() {
-			waitDone <- c.cmd.Wait()
-		}()
-
-		waitDelay := c.waitDelay
-		if waitDelay <= 0 {
-			waitDelay = 2 * time.Second
-		}
-
-		var waitErr error
-		select {
-		case waitErr = <-waitDone:
-			// Process exited cleanly on stdin EOF
-		case <-time.After(1 * time.Second):
-			// Process ignored stdin EOF: escalate to SIGTERM on process group
-			if c.cmd.Process != nil {
-				pgid, err := syscall.Getpgid(c.cmd.Process.Pid)
-				if err != nil {
-					pgid = c.cmd.Process.Pid
-				}
-				_ = syscall.Kill(-pgid, syscall.SIGTERM)
-			}
-			select {
-			case waitErr = <-waitDone:
-				// Exited on SIGTERM
-			case <-time.After(waitDelay):
-				// WaitDelay expired: escalate to SIGKILL on process group
-				if c.cmd.Process != nil {
-					pgid, err := syscall.Getpgid(c.cmd.Process.Pid)
-					if err != nil {
-						pgid = c.cmd.Process.Pid
-					}
-					_ = syscall.Kill(-pgid, syscall.SIGKILL)
-				}
-				waitErr = <-waitDone
-			}
-		}
-
-		c.closeErr = errors.Join(inErr, outErr, waitErr)
-	})
-	return c.closeErr
-}
-func (c *stdioConn) LocalAddr() net.Addr                { return stdioAddr{} }
-func (c *stdioConn) RemoteAddr() net.Addr               { return stdioAddr{} }
-func (c *stdioConn) SetDeadline(t time.Time) error      { return nil }
-func (c *stdioConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *stdioConn) SetWriteDeadline(t time.Time) error { return nil }
-
-type stdioAddr struct{}
-
-func (stdioAddr) Network() string { return "stdio" }
-func (stdioAddr) String() string  { return "stdio" }
-
 func spawnBridge(t *testing.T, ctx context.Context, agentFolder, script string) (agentv1.AgentServiceClient, func()) {
 	wackyacpBin := getWackyacpBin(t)
 	shimBin := getShimBin(t)
@@ -162,35 +88,13 @@ func spawnBridge(t *testing.T, ctx context.Context, agentFolder, script string) 
 	}
 
 	cmd := exec.CommandContext(ctx, wackyacpBin, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	// Go 1.20+ process-group cancellation
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		pgid, err := syscall.Getpgid(cmd.Process.Pid)
-		if err == nil {
-			return syscall.Kill(-pgid, syscall.SIGTERM)
-		}
-		return cmd.Process.Signal(syscall.SIGTERM)
-	}
-	cmd.WaitDelay = 2 * time.Second
-
-	stdin, err := cmd.StdinPipe()
+	// The shared pkg/stdio DialCommand owns the pipes, Setsid process-group
+	// isolation, and SIGTERM/SIGKILL escalation on Close (killed client cannot
+	// orphan the bridge).
+	conn, err := stdio.DialCommand(ctx, cmd, 2*time.Second)
 	if err != nil {
-		t.Fatalf("stdin pipe failed: %v", err)
+		t.Fatalf("DialCommand: %v", err)
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe failed: %v", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting wackyacp failed: %v", err)
-	}
-
-	conn := &stdioConn{stdin: stdin, stdout: stdout, cmd: cmd, waitDelay: 2 * time.Second}
 
 	gc, err := grpc.NewClient(
 		"passthrough:///wackyacp",
@@ -590,13 +494,10 @@ func TestE2E_ConcurrentDispatches_WaitThenSucceed(t *testing.T) {
 	// The flock is held for the whole bridge PROCESS lifetime (released when the
 	// process exits, i.e. when its stdin EOFs via conn close).
 	cmd1 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=hold-turn -marker="+e2eMarker)
-	cmd1.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	stdin1, _ := cmd1.StdinPipe()
-	stdout1, _ := cmd1.StdoutPipe()
-	if err := cmd1.Start(); err != nil {
+	conn1, err := stdio.DialCommand(context.Background(), cmd1, 2*time.Second)
+	if err != nil {
 		t.Fatalf("start bridge1: %v", err)
 	}
-	conn1 := &stdioConn{stdin: stdin1, stdout: stdout1, cmd: cmd1, waitDelay: 2 * time.Second}
 	g1, _ := grpc.NewClient("passthrough:///w1", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn1, nil }))
 	client1 := agentv1.NewAgentServiceClient(g1)
 	t.Cleanup(func() { _ = g1.Close(); _ = conn1.Close() })
@@ -625,14 +526,11 @@ func TestE2E_ConcurrentDispatches_WaitThenSucceed(t *testing.T) {
 	// server (and therefore the grpc handshake) only comes up after the lock is free.
 	stderrGuard := &guardBuffer{mu: &stderrMu, buf: &stderr2}
 	cmd2 := exec.Command(wackyacpBin, "--agent-folder="+agentFolder, "--harness-cmd="+shimBin, "--harness-args=--script=normal -marker="+e2eMarker)
-	cmd2.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd2.Stderr = stderrGuard
-	stdin2, _ := cmd2.StdinPipe()
-	stdout2, _ := cmd2.StdoutPipe()
-	if err := cmd2.Start(); err != nil {
+	conn2, err := stdio.DialCommand(context.Background(), cmd2, 2*time.Second)
+	if err != nil {
 		t.Fatalf("start bridge2: %v", err)
 	}
-	conn2 := &stdioConn{stdin: stdin2, stdout: stdout2, cmd: cmd2, waitDelay: 2 * time.Second}
 	g2, _ := grpc.NewClient("passthrough:///w2", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn2, nil }))
 	client2 := agentv1.NewAgentServiceClient(g2)
 	t.Cleanup(func() { _ = g2.Close(); _ = conn2.Close() })
@@ -773,32 +671,10 @@ func TestE2E_ProcessHygiene_SimulatedFailure(t *testing.T) {
 		}
 
 		cmd := exec.CommandContext(ctx, wackyacpBin, args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		cmd.Cancel = func() error {
-			if cmd.Process == nil {
-				return nil
-			}
-			pgid, err := syscall.Getpgid(cmd.Process.Pid)
-			if err == nil {
-				return syscall.Kill(-pgid, syscall.SIGTERM)
-			}
-			return cmd.Process.Signal(syscall.SIGTERM)
-		}
-		cmd.WaitDelay = 2 * time.Second
-
-		stdin, err := cmd.StdinPipe()
+		conn, err := stdio.DialCommand(ctx, cmd, 2*time.Second)
 		if err != nil {
-			t.Fatalf("stdin pipe: %v", err)
+			t.Fatalf("DialCommand: %v", err)
 		}
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			t.Fatalf("stdout pipe: %v", err)
-		}
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("cmd.Start: %v", err)
-		}
-
-		conn := &stdioConn{stdin: stdin, stdout: stdout, cmd: cmd, waitDelay: 2 * time.Second}
 		t.Cleanup(func() {
 			_ = conn.Close()
 		})
