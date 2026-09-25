@@ -2,8 +2,8 @@ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFI
 github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
-github.com/colinrgodsey/wackypub v0.0.0-20260923123843-28c79e38f9a4 h1:UL6JcarkKf9fyQIbz5dV4O37Ku/E5xYzL0AjiN77ekA=
-github.com/colinrgodsey/wackypub v0.0.0-20260923123843-28c79e38f9a4/go.mod h1:vc7xo+uYyYFlg0m6xxBoPDeDiW8F3EBhDfZ2DNjRPL0=
+github.com/colinrgodsey/wackypub v0.0.0-20260924235706-d2c7a3659b2c h1:E0QS/qS5S8bcbc2PU24sG7MbtOX8b6Go4vdt1H61fWM=
+github.com/colinrgodsey/wackypub v0.0.0-20260924235706-d2c7a3659b2c/go.mod h1:vc7xo+uYyYFlg0m6xxBoPDeDiW8F3EBhDfZ2DNjRPL0=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
