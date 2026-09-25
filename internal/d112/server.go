@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/colinrgodsey/wackyacp/internal/acp"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
+	"github.com/colinrgodsey/wackypub/pkg/stdio"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -310,130 +309,14 @@ func (s *Server) InspectAgent(ctx context.Context, req *agentv1.InspectAgentRequ
 	}, nil
 }
 
-// fixedConnListener satisfies net.Listener for a single pre-established net.Conn.
-type fixedConnListener struct {
-	conn      net.Conn
-	once      sync.Once
-	closeOnce sync.Once
-	closedCh  chan struct{}
-}
-
-func newFixedConnListener(conn net.Conn) *fixedConnListener {
-	return &fixedConnListener{
-		conn:     conn,
-		closedCh: make(chan struct{}),
-	}
-}
-
-func (l *fixedConnListener) Accept() (net.Conn, error) {
-	var c net.Conn
-	l.once.Do(func() {
-		c = l.conn
-	})
-	if c != nil {
-		return c, nil
-	}
-	<-l.closedCh
-	return nil, net.ErrClosed
-}
-
-func (l *fixedConnListener) Close() error {
-	l.closeOnce.Do(func() {
-		close(l.closedCh)
-	})
-	return l.conn.Close()
-}
-
-func (l *fixedConnListener) Addr() net.Addr {
-	return l.conn.LocalAddr()
-}
-
-// ServerStdioConn adapts process stdin (read) and stdout (write) to net.Conn.
-type ServerStdioConn struct {
-	stdin     io.ReadCloser
-	stdout    io.WriteCloser
-	onEOF     func()
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func NewServerStdioConn(stdin io.ReadCloser, stdout io.WriteCloser, onEOF func()) *ServerStdioConn {
-	return &ServerStdioConn{
-		stdin:  stdin,
-		stdout: stdout,
-		onEOF:  onEOF,
-	}
-}
-
-func (c *ServerStdioConn) Read(b []byte) (int, error) {
-	n, err := c.stdin.Read(b)
-	if err != nil {
-		if c.onEOF != nil {
-			c.onEOF()
-		}
-	}
-	return n, err
-}
-
-func (c *ServerStdioConn) Write(b []byte) (int, error) {
-	return c.stdout.Write(b)
-}
-
-func (c *ServerStdioConn) Close() error {
-	c.closeOnce.Do(func() {
-		inErr := c.stdin.Close()
-		outErr := c.stdout.Close()
-		c.closeErr = errors.Join(inErr, outErr)
-		if c.onEOF != nil {
-			c.onEOF()
-		}
-	})
-	return c.closeErr
-}
-
-func (c *ServerStdioConn) LocalAddr() net.Addr                { return stdioAddr{} }
-func (c *ServerStdioConn) RemoteAddr() net.Addr               { return stdioAddr{} }
-func (c *ServerStdioConn) SetDeadline(t time.Time) error      { return nil }
-func (c *ServerStdioConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *ServerStdioConn) SetWriteDeadline(t time.Time) error { return nil }
-
-type stdioAddr struct{}
-
-func (stdioAddr) Network() string { return "stdio" }
-func (stdioAddr) String() string  { return "stdio" }
-
-// ServeStdio registers the D112 server and serves gRPC over stdin/stdout until EOF or cancellation.
+// ServeStdio registers the D112 server and serves gRPC over stdin/stdout until
+// the client closes (EOF), ctx cancellation, or the server stops. The conn +
+// listener machinery lives in the shared pkg/stdio package so both binaries use
+// one implementation; cleanup behavior (graceful stop on EOF) is identical to the
+// pre-consolidation copy.
 func ServeStdio(ctx context.Context, srv *Server, stdin io.ReadCloser, stdout io.WriteCloser) error {
 	grpcServer := grpc.NewServer()
 	agentv1.RegisterAgentServiceServer(grpcServer, srv)
-
-	var stopOnce sync.Once
-	onEOF := func() {
-		stopOnce.Do(func() {
-			go func() {
-				time.Sleep(30 * time.Millisecond)
-				grpcServer.GracefulStop()
-			}()
-		})
-	}
-
-	conn := NewServerStdioConn(stdin, stdout, onEOF)
-	listener := newFixedConnListener(conn)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- grpcServer.Serve(listener)
-	}()
-
-	select {
-	case <-ctx.Done():
-		grpcServer.GracefulStop()
-		_ = listener.Close()
-		return ctx.Err()
-	case err := <-errCh:
-		if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, grpc.ErrServerStopped) {
-			return nil
-		}
-		return err
-	}
+	conn := stdio.NewConn(stdin, stdout)
+	return stdio.ServeContext(ctx, grpcServer, conn)
 }
