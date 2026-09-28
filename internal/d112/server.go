@@ -302,11 +302,21 @@ func (s *Server) SetModelConfig(ctx context.Context, req *agentv1.SetModelConfig
 	}
 	raw, err := s.driver.SetConfigOption(ctx, s.sessionID, "model", req.GetModel())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "model config failed: %v", err)
+		// A harness rejection is a CLIENT error (unknown model / unsupported config id), not
+		// a server fault: the config request was valid RPC but the harness refused it. Map it
+		// to InvalidArgument here (status errors cannot carry error chains, so the mapping
+		// happens by inspecting the driver error before constructing the status; the client
+		// keeps ErrTurnFailed/ConfigOptionError reachable for in-process callers).
+		var cfgErr *acp.ConfigOptionError
+		if errors.As(err, &cfgErr) {
+			return nil, status.Error(codes.InvalidArgument, "model config rejected by the harness: "+err.Error())
+		}
+		return nil, status.Error(codes.Internal, "model config failed: "+err.Error())
 	}
 	// The harness response is the ACP configOptions array; forward the raw JSON so the
 	// caller can inspect the confirmation and the full choice set without re-decoding ACP
-	// shapes here. The canonical model id is the requested value as confirmed by the harness.
+	// shapes here. The model field echoes the requested value; the harness's own
+	// configOptions array carries the authoritative confirmation (selected label/value).
 	return &agentv1.SetModelConfigResponse{
 		Model:         req.GetModel(),
 		ConfigOptions: string(raw),

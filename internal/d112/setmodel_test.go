@@ -5,7 +5,11 @@ import (
 	"strings"
 	"testing"
 
+	"errors"
+	"github.com/colinrgodsey/wackyacp/internal/acp"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestSetModelConfig_ForwardsToHarness pins the session-scoped passthrough: the bridged
@@ -34,6 +38,60 @@ func TestD112_SetModelConfig_ForwardsToHarness(t *testing.T) {
 	}
 	if !strings.Contains(resp.GetConfigOptions(), "sonnet") {
 		t.Errorf("config_options should carry the harness confirmation, got %q", resp.GetConfigOptions())
+	}
+}
+
+// TestD112_SetModelConfig_HarnessRejectionMapsToInvalidArgument pins phoebe's error-wrapping
+// nit: an ACP harness rejection (unknown model / unsupported config id) is a CLIENT error -
+// the bridge must surface codes.InvalidArgument (not Internal) and keep the chain so
+// errors.As to *acp.ConfigOptionError / errors.Is against ErrTurnFailed still work.
+func TestD112_SetModelConfig_HarnessRejectionMapsToInvalidArgument(t *testing.T) {
+	driver := &mockACPDriver{
+		setConfigErr: &acp.ConfigOptionError{Code: -32602, Message: "unsupported configId: temperature"},
+	}
+	srv := NewServer(driver, "sess-abc", "/path/to/agent")
+
+	_, err := srv.SetModelConfig(context.Background(), &agentv1.SetModelConfigRequest{
+		AgentId: "bridgedagent",
+		Model:   "temperature",
+	})
+	if err == nil {
+		t.Fatal("expected harness rejection error, got nil")
+	}
+	if st, ok := status.FromError(err); ok {
+		if st.Code() != codes.InvalidArgument {
+			t.Errorf("harness rejection code = %v, want InvalidArgument", st.Code())
+		}
+	} else {
+		t.Fatalf("expected a status error, got: %v", err)
+	}
+	// status errors cannot carry error chains, so the ConfigOptionError reachability is
+	// asserted at the CLIENT layer (TestClient_SetConfigOption_UnsupportedConfigID...);
+	// here we pin that the mapping fired and surfaced the harness's explanation.
+	if !strings.Contains(err.Error(), "session/setConfigOption: [-32602]") {
+		t.Errorf("rejection message should carry the harness code/message, got %v", err)
+	}
+}
+
+// TestD112_SetModelConfig_OtherDriverFailureStaysInternal pins that non-harness driver
+// failures (transport, unexpected) remain codes.Internal with the cause reachable.
+func TestD112_SetModelConfig_OtherDriverFailureStaysInternal(t *testing.T) {
+	driver := &mockACPDriver{setConfigErr: errors.New("transport broke")}
+	srv := NewServer(driver, "sess-abc", "/path/to/agent")
+
+	_, err := srv.SetModelConfig(context.Background(), &agentv1.SetModelConfigRequest{
+		AgentId: "bridgedagent",
+		Model:   "sonnet",
+	})
+	if err == nil {
+		t.Fatal("expected driver failure error, got nil")
+	}
+	if st, ok := status.FromError(err); ok {
+		if st.Code() != codes.Internal {
+			t.Errorf("plain driver failure code = %v, want Internal", st.Code())
+		}
+	} else {
+		t.Fatalf("expected a status error, got: %v", err)
 	}
 }
 

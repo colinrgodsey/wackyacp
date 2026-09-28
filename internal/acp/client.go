@@ -625,7 +625,9 @@ func (c *Client) sendRequest(ctx context.Context, method string, params any) (*r
 			return nil, c.err
 		}
 		if resp.Error != nil {
-			return nil, fmt.Errorf("%w: [%d] %s", ErrTurnFailed, resp.Error.Code, resp.Error.Message)
+			// Wrap the RPCError itself so errors.As can reach the JSON-RPC code/message while
+			// errors.Is keeps seeing ErrTurnFailed; Error() renders the same "[code] message".
+			return nil, fmt.Errorf("%w: %w", ErrTurnFailed, resp.Error)
 		}
 		return resp, nil
 	}
@@ -901,11 +903,17 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 }
 
 // Cancel sends a session/cancel notification to abort an in-flight prompt turn.
+func (c *Client) Cancel(sessionID string) error {
+	return c.sendNotification(MethodSessionCancel, map[string]any{
+		"sessionId": sessionID,
+	})
+}
+
 // SetConfigOption sends session/setConfigOption to the harness (configId "model" is the
-// only supported option today). It returns the harness's configOptions array verbatim and
-// a parsed canonical model id when the response carries one. The harness confirms the
-// session-scoped model change in its response (or returns an RPC error for an unknown
-// model or config id) - we tunnel that error back rather than inventing our own.
+// only supported option today). It returns the harness's configOptions array verbatim. The
+// harness confirms the session-scoped model change in its response, or returns an RPC error
+// for an unknown model or config id - a *ConfigOptionError is returned so callers can map
+// the JSON-RPC code without string-matching, while errors.Is(err, ErrTurnFailed) still works.
 func (c *Client) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
 	resp, err := c.sendRequest(ctx, MethodSessionSetConfigOption, map[string]any{
 		"sessionId": sessionID,
@@ -913,6 +921,9 @@ func (c *Client) SetConfigOption(ctx context.Context, sessionID, configID, value
 		"value":     value,
 	})
 	if err != nil {
+		if rpcErr := new(RPCError); errors.As(err, &rpcErr) {
+			return nil, &ConfigOptionError{Code: rpcErr.Code, Message: rpcErr.Message}
+		}
 		return nil, fmt.Errorf("%s failed: %w", MethodSessionSetConfigOption, err)
 	}
 	// The harness's response is an object with at least configOptions; keep it raw so the
@@ -920,8 +931,19 @@ func (c *Client) SetConfigOption(ctx context.Context, sessionID, configID, value
 	return resp.Result, nil
 }
 
-func (c *Client) Cancel(sessionID string) error {
-	return c.sendNotification(MethodSessionCancel, map[string]any{
-		"sessionId": sessionID,
-	})
+// ConfigOptionError is returned when the harness rejects a session/setConfigOption call. Code
+// is the JSON-RPC error code from the harness (-32602 invalid params for an unknown model or
+// unsupported config id); Message is the harness's explanation. It unwraps to ErrTurnFailed so
+// existing errors.Is checks against the sentinel keep working.
+type ConfigOptionError struct {
+	Code    int
+	Message string
+}
+
+func (e *ConfigOptionError) Error() string {
+	return fmt.Sprintf("%s: [%d] %s", MethodSessionSetConfigOption, e.Code, e.Message)
+}
+
+func (e *ConfigOptionError) Unwrap() error {
+	return ErrTurnFailed
 }

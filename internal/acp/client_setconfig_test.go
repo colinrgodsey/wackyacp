@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -45,7 +46,18 @@ func TestClient_SetConfigOption_UnsupportedConfigIDSurfacesHarnessError(t *testi
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	if _, err := client.SetConfigOption(ctx, "shim-session-", "temperature", "0.5"); err == nil {
+	_, err := client.SetConfigOption(ctx, "shim-session-", "temperature", "0.5")
+	if err == nil {
 		t.Fatal("expected error for unsupported configId, got nil")
+	}
+	var cfgErr *ConfigOptionError
+	if !errors.As(err, &cfgErr) {
+		t.Fatalf("unsupported configId should surface as *ConfigOptionError, got %v", err)
+	}
+	if cfgErr.Code != -32602 {
+		t.Errorf("ConfigOptionError code = %d, want -32602 (invalid params)", cfgErr.Code)
+	}
+	if !errors.Is(err, ErrTurnFailed) {
+		t.Errorf("ConfigOptionError should still unwrap to ErrTurnFailed")
 	}
 }

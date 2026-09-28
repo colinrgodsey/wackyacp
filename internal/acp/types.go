@@ -2,6 +2,7 @@ package acp
 
 import (
 	"encoding/json"
+	"fmt"
 )
 
 // JSON-RPC 2.0 wire types
@@ -27,7 +28,13 @@ type RPCError struct {
 }
 
 func (e *RPCError) Error() string {
-	return e.Message
+	if e == nil {
+		return ""
+	}
+	if e.Code == 0 {
+		return e.Message
+	}
+	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
 }
 
 // AgentCapabilities mirrors ACP initialization response capabilities.

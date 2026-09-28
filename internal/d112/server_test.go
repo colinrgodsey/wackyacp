@@ -30,6 +30,7 @@ type mockACPDriver struct {
 	cancelCh          chan string
 	setConfigCalls    int
 	setConfigValue    string
+	setConfigErr      error
 	canceledSessionID string
 }
 
@@ -72,6 +73,9 @@ func (m *mockACPDriver) Prompt(ctx context.Context, sessionID, promptText string
 func (m *mockACPDriver) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
 	m.setConfigCalls++
 	m.setConfigValue = value
+	if m.setConfigErr != nil {
+		return nil, m.setConfigErr
+	}
 	return json.RawMessage(`[{"key":"model","options":[{"label":"sonnet","value":"sonnet"}]}]`), nil
 }
 
