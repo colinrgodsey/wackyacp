@@ -2,6 +2,7 @@ package d112
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -27,6 +28,8 @@ type mockACPDriver struct {
 	err               error
 	promptHook        func(ctx context.Context)
 	cancelCh          chan string
+	setConfigCalls    int
+	setConfigValue    string
 	canceledSessionID string
 }
 
@@ -64,6 +67,12 @@ func (m *mockACPDriver) Prompt(ctx context.Context, sessionID, promptText string
 		StopReason: "end_turn",
 		Usage:      m.usage,
 	}, nil
+}
+
+func (m *mockACPDriver) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
+	m.setConfigCalls++
+	m.setConfigValue = value
+	return json.RawMessage(`[{"key":"model","options":[{"label":"sonnet","value":"sonnet"}]}]`), nil
 }
 
 func (m *mockACPDriver) Cancel(sessionID string) error {

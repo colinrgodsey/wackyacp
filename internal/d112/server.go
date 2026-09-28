@@ -2,6 +2,7 @@ package d112
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -19,6 +20,7 @@ import (
 type ACPDriver interface {
 	Prompt(ctx context.Context, sessionID, promptText string, callbacks acp.TurnCallbacks) (*acp.PromptResult, error)
 	Cancel(sessionID string) error
+	SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error)
 }
 
 // Server implements agentv1.AgentServiceServer for wackyacp.
@@ -284,6 +286,31 @@ func (s *Server) AsideQuestion(ctx context.Context, req *agentv1.AsideQuestionRe
 		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
 	}
 	return nil, status.Errorf(codes.Unimplemented, "aside is not supported over the ACP bridge: bridged harness sessions cannot fork the agent's accumulated context (use the local agent path for aside)")
+}
+
+// SetModelConfig implements agentv1.AgentServiceServer: change the model of this bridged
+// session by forwarding session/setConfigOption (configId "model") to the harness.
+// Session-scoped: the change applies to the current bridged session and is persisted by the
+// harness across bridge restarts. The harness's configOptions array is passed through
+// verbatim so the caller can confirm the new model and see the full choice set.
+func (s *Server) SetModelConfig(ctx context.Context, req *agentv1.SetModelConfigRequest) (*agentv1.SetModelConfigResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	if req.GetModel() == "" {
+		return nil, status.Error(codes.InvalidArgument, "model cannot be empty")
+	}
+	raw, err := s.driver.SetConfigOption(ctx, s.sessionID, "model", req.GetModel())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "model config failed: %v", err)
+	}
+	// The harness response is the ACP configOptions array; forward the raw JSON so the
+	// caller can inspect the confirmation and the full choice set without re-decoding ACP
+	// shapes here. The canonical model id is the requested value as confirmed by the harness.
+	return &agentv1.SetModelConfigResponse{
+		Model:         req.GetModel(),
+		ConfigOptions: string(raw),
+	}, nil
 }
 
 func (s *Server) ReadSession(ctx context.Context, req *agentv1.ReadSessionRequest) (*agentv1.ReadSessionResponse, error) {

@@ -438,6 +438,25 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 			})
 		}
 
+	case "session/setConfigOption", "session/set_config_option":
+		var params struct {
+			SessionID string `json:"sessionId"`
+			ConfigID  string `json:"configId"`
+			Value     string `json:"value"`
+		}
+		_ = json.Unmarshal(msg.Params, &params)
+		if params.ConfigID != "model" {
+			return s.sendError(msg.ID, -32602, "unsupported configId: "+params.ConfigID)
+		}
+		return s.sendResult(msg.ID, map[string]any{
+			"configOptions": []map[string]any{
+				{"key": "model", "options": []map[string]any{
+					{"label": params.Value, "value": params.Value},
+					{"label": "default", "value": "default"},
+				}, "selected": params.Value},
+			},
+		})
+
 	case "session/cancel":
 		return nil
 

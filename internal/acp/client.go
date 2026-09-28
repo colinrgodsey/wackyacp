@@ -901,6 +901,25 @@ func (c *Client) Prompt(ctx context.Context, sessionID, promptText string, callb
 }
 
 // Cancel sends a session/cancel notification to abort an in-flight prompt turn.
+// SetConfigOption sends session/setConfigOption to the harness (configId "model" is the
+// only supported option today). It returns the harness's configOptions array verbatim and
+// a parsed canonical model id when the response carries one. The harness confirms the
+// session-scoped model change in its response (or returns an RPC error for an unknown
+// model or config id) - we tunnel that error back rather than inventing our own.
+func (c *Client) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
+	resp, err := c.sendRequest(ctx, MethodSessionSetConfigOption, map[string]any{
+		"sessionId": sessionID,
+		"configId":  configID,
+		"value":     value,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%s failed: %w", MethodSessionSetConfigOption, err)
+	}
+	// The harness's response is an object with at least configOptions; keep it raw so the
+	// d112 layer can forward the confirmation without re-decoding ACP shapes.
+	return resp.Result, nil
+}
+
 func (c *Client) Cancel(sessionID string) error {
 	return c.sendNotification(MethodSessionCancel, map[string]any{
 		"sessionId": sessionID,
