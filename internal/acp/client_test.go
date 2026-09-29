@@ -45,8 +45,9 @@ func startShimClient(t *testing.T, script string) (*Client, *harness.Process) {
 	ctx := context.Background()
 
 	proc, err := harness.Start(ctx, harness.Config{
-		Command: bin,
-		Args:    []string{"--script=" + script},
+		Command:     bin,
+		Args:        []string{"--script=" + script},
+		AgentFolder: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("starting shim failed: %v", err)

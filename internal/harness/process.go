@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -120,12 +121,9 @@ func Start(ctx context.Context, cfg Config) (*Process, error) {
 // if the harness does not exit on stdin EOF within a brief grace period.
 func (p *Process) Close() error {
 	p.closeOnce.Do(func() {
-		var stdinErr, stdoutErr error
+		var stdinErr error
 		if p.Stdin != nil {
 			stdinErr = p.Stdin.Close()
-		}
-		if p.Stdout != nil {
-			stdoutErr = p.Stdout.Close()
 		}
 
 		waitDone := make(chan error, 1)
@@ -187,6 +185,13 @@ func (p *Process) Close() error {
 					}
 					waitErr = <-waitDone
 				}
+			}
+		}
+
+		var stdoutErr error
+		if p.Stdout != nil {
+			if err := p.Stdout.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !strings.Contains(err.Error(), "already closed") {
+				stdoutErr = err
 			}
 		}
 

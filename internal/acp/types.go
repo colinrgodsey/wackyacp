@@ -2,6 +2,7 @@ package acp
 
 import (
 	"encoding/json"
+	"fmt"
 )
 
 // JSON-RPC 2.0 wire types
@@ -27,7 +28,30 @@ type RPCError struct {
 }
 
 func (e *RPCError) Error() string {
-	return e.Message
+	if e == nil {
+		return ""
+	}
+	if e.Code == 0 {
+		return e.Message
+	}
+	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
+}
+
+// ConfigOptionError is returned when the harness rejects a session/setConfigOption call. Code
+// is the JSON-RPC error code from the harness (-32602 invalid params for an unknown model or
+// unsupported config id); Message is the harness's explanation. It unwraps to ErrTurnFailed so
+// existing errors.Is checks against the sentinel keep working.
+type ConfigOptionError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *ConfigOptionError) Error() string {
+	return fmt.Sprintf("%s: [%d] %s", MethodSessionSetConfigOption, e.Code, e.Message)
+}
+
+func (e *ConfigOptionError) Unwrap() error {
+	return ErrTurnFailed
 }
 
 // AgentCapabilities mirrors ACP initialization response capabilities.
@@ -53,20 +77,23 @@ type InitializeResult struct {
 
 // NewSessionResult represents the result of a session/new request.
 type NewSessionResult struct {
-	SessionID string         `json:"sessionId"`
-	Meta      map[string]any `json:"_meta,omitempty"`
+	SessionID     string          `json:"sessionId"`
+	ConfigOptions json.RawMessage `json:"configOptions,omitempty"`
+	Meta          map[string]any  `json:"_meta,omitempty"`
 }
 
 // ResumeSessionResult represents the result of a session/resume request.
 type ResumeSessionResult struct {
-	Modes map[string]any `json:"modes,omitempty"`
-	Meta  map[string]any `json:"_meta,omitempty"`
+	ConfigOptions json.RawMessage `json:"configOptions,omitempty"`
+	Modes         map[string]any  `json:"modes,omitempty"`
+	Meta          map[string]any  `json:"_meta,omitempty"`
 }
 
 // LoadSessionResult represents the result of a session/load request.
 type LoadSessionResult struct {
-	Modes map[string]any `json:"modes,omitempty"`
-	Meta  map[string]any `json:"_meta,omitempty"`
+	ConfigOptions json.RawMessage `json:"configOptions,omitempty"`
+	Modes         map[string]any  `json:"modes,omitempty"`
+	Meta          map[string]any  `json:"_meta,omitempty"`
 }
 
 // PromptResult represents the completion of a prompt turn.

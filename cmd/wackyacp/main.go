@@ -105,7 +105,23 @@ func run() error {
 	return nil
 }
 
+func isModelCommand(args []string) bool {
+	for _, a := range args {
+		if a == "model" {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
+	if isModelCommand(os.Args[1:]) {
+		if err := runModel(os.Args[1:]); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "wackyacp: %v\n", err)
 		os.Exit(1)
