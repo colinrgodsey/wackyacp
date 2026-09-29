@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,12 +29,33 @@ type rpcError struct {
 }
 
 type acpShim struct {
-	script     string
-	reader     *bufio.Reader
-	writerMu   sync.Mutex
-	writer     io.Writer
-	reqCounter atomic.Int64
-	respChans  sync.Map // map[any]chan *rpcMessage
+	script       string
+	reader       *bufio.Reader
+	writerMu     sync.Mutex
+	writer       io.Writer
+	reqCounter   atomic.Int64
+	respChans    sync.Map // map[any]chan *rpcMessage
+	modelMu      sync.Mutex
+	currentModel string
+}
+
+func (s *acpShim) getModel() string {
+	s.modelMu.Lock()
+	defer s.modelMu.Unlock()
+	if data, err := os.ReadFile(".shim_model"); err == nil && len(data) > 0 {
+		return string(bytes.TrimSpace(data))
+	}
+	if s.currentModel == "" {
+		return "default"
+	}
+	return s.currentModel
+}
+
+func (s *acpShim) setModel(m string) {
+	s.modelMu.Lock()
+	defer s.modelMu.Unlock()
+	s.currentModel = m
+	_ = os.WriteFile(".shim_model", []byte(m), 0644)
 }
 
 func (s *acpShim) send(msg *rpcMessage) error {
@@ -169,6 +192,22 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 			"modes": map[string]any{
 				"currentModeId": "code",
 			},
+			"configOptions": []map[string]any{
+				{
+					"id":           "model",
+					"key":          "model",
+					"name":         "Model",
+					"category":     "model",
+					"type":         "select",
+					"currentValue": s.getModel(),
+					"options": []map[string]any{
+						{"value": "sonnet", "label": "sonnet", "name": "sonnet"},
+						{"value": "opus", "label": "opus", "name": "opus"},
+						{"value": "default", "label": "default", "name": "default"},
+					},
+					"selected": s.getModel(),
+				},
+			},
 		}
 		if params.Meta != nil {
 			result["_meta"] = params.Meta
@@ -189,6 +228,22 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 			"modes": map[string]any{
 				"currentModeId": "code",
 			},
+			"configOptions": []map[string]any{
+				{
+					"id":           "model",
+					"key":          "model",
+					"name":         "Model",
+					"category":     "model",
+					"type":         "select",
+					"currentValue": s.getModel(),
+					"options": []map[string]any{
+						{"value": "sonnet", "label": "sonnet", "name": "sonnet"},
+						{"value": "opus", "label": "opus", "name": "opus"},
+						{"value": "default", "label": "default", "name": "default"},
+					},
+					"selected": s.getModel(),
+				},
+			},
 		}
 		if params.Meta != nil {
 			result["_meta"] = params.Meta
@@ -203,6 +258,22 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 		_ = json.Unmarshal(msg.Params, &params)
 		result := map[string]any{
 			"sessionId": "shim-session-" + s.script,
+			"configOptions": []map[string]any{
+				{
+					"id":           "model",
+					"key":          "model",
+					"name":         "Model",
+					"category":     "model",
+					"type":         "select",
+					"currentValue": s.getModel(),
+					"options": []map[string]any{
+						{"value": "sonnet", "label": "sonnet", "name": "sonnet"},
+						{"value": "opus", "label": "opus", "name": "opus"},
+						{"value": "default", "label": "default", "name": "default"},
+					},
+					"selected": s.getModel(),
+				},
+			},
 		}
 		if params.Meta != nil {
 			result["_meta"] = params.Meta
@@ -437,6 +508,38 @@ func (s *acpShim) handleMessage(msg *rpcMessage) error {
 				"stopReason": "end_turn",
 			})
 		}
+
+	case "session/setConfigOption", "session/set_config_option":
+		var params struct {
+			SessionID string `json:"sessionId"`
+			ConfigID  string `json:"configId"`
+			Value     string `json:"value"`
+		}
+		_ = json.Unmarshal(msg.Params, &params)
+		if params.ConfigID != "model" {
+			return s.sendError(msg.ID, -32602, "unsupported configId: "+params.ConfigID)
+		}
+		if params.Value == "unknown-model" || strings.HasPrefix(params.Value, "unknown") {
+			return s.sendError(msg.ID, -32602, "unknown model: "+params.Value)
+		}
+		s.setModel(params.Value)
+		return s.sendResult(msg.ID, map[string]any{
+			"configOptions": []map[string]any{
+				{
+					"id":           "model",
+					"key":          "model",
+					"name":         "Model",
+					"category":     "model",
+					"type":         "select",
+					"currentValue": params.Value,
+					"options": []map[string]any{
+						{"label": params.Value, "value": params.Value, "name": params.Value},
+						{"label": "default", "value": "default", "name": "default"},
+					},
+					"selected": params.Value,
+				},
+			},
+		})
 
 	case "session/cancel":
 		return nil

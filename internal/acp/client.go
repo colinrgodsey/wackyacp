@@ -106,9 +106,28 @@ type Client struct {
 	// trusted local harnesses (used for Claude via claude-agent-acp).
 	PermissionMode string
 
+	lastConfigOptionsMu sync.RWMutex
+	lastConfigOptions   json.RawMessage
+
 	doneCh chan struct{}
 	errMu  sync.RWMutex
 	err    error
+}
+
+// LastConfigOptions returns the most recently received configOptions from the harness.
+func (c *Client) LastConfigOptions() json.RawMessage {
+	c.lastConfigOptionsMu.RLock()
+	defer c.lastConfigOptionsMu.RUnlock()
+	return c.lastConfigOptions
+}
+
+func (c *Client) setLastConfigOptions(raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	c.lastConfigOptionsMu.Lock()
+	defer c.lastConfigOptionsMu.Unlock()
+	c.lastConfigOptions = raw
 }
 
 // NewClient initializes a new ACP client communicating over stdin and stdout.
@@ -625,7 +644,9 @@ func (c *Client) sendRequest(ctx context.Context, method string, params any) (*r
 			return nil, c.err
 		}
 		if resp.Error != nil {
-			return nil, fmt.Errorf("%w: [%d] %s", ErrTurnFailed, resp.Error.Code, resp.Error.Message)
+			// Wrap the RPCError itself so errors.As can reach the JSON-RPC code/message while
+			// errors.Is keeps seeing ErrTurnFailed; Error() renders the same "[code] message".
+			return nil, fmt.Errorf("%w: %w", ErrTurnFailed, resp.Error)
 		}
 		return resp, nil
 	}
@@ -723,6 +744,9 @@ func (c *Client) ResumeSession(ctx context.Context, sessionID, agentFolder strin
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		return fmt.Errorf("unmarshaling resume result: %w", err)
 	}
+	if len(result.ConfigOptions) > 0 {
+		c.setLastConfigOptions(result.ConfigOptions)
+	}
 
 	// Verify session ownership if metadata returned
 	if result.Meta != nil {
@@ -750,6 +774,9 @@ func (c *Client) LoadSession(ctx context.Context, sessionID, agentFolder string)
 	var result LoadSessionResult
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		return fmt.Errorf("unmarshaling load result: %w", err)
+	}
+	if len(result.ConfigOptions) > 0 {
+		c.setLastConfigOptions(result.ConfigOptions)
 	}
 
 	// Verify session ownership if metadata returned
@@ -781,6 +808,9 @@ func (c *Client) NewSession(ctx context.Context, agentFolder string) (string, er
 	}
 	if result.SessionID == "" {
 		return "", fmt.Errorf("empty sessionId returned from %s", MethodSessionNew)
+	}
+	if len(result.ConfigOptions) > 0 {
+		c.setLastConfigOptions(result.ConfigOptions)
 	}
 	return result.SessionID, nil
 }
@@ -905,4 +935,26 @@ func (c *Client) Cancel(sessionID string) error {
 	return c.sendNotification(MethodSessionCancel, map[string]any{
 		"sessionId": sessionID,
 	})
+}
+
+// SetConfigOption sends session/setConfigOption to the harness (configId "model" is the
+// only supported option today). It returns the harness's configOptions array verbatim. The
+// harness confirms the session-scoped model change in its response, or returns an RPC error
+// for an unknown model or config id - a *ConfigOptionError is returned so callers can map
+// the JSON-RPC code without string-matching, while errors.Is(err, ErrTurnFailed) still works.
+func (c *Client) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
+	resp, err := c.sendRequest(ctx, MethodSessionSetConfigOption, map[string]any{
+		"sessionId": sessionID,
+		"configId":  configID,
+		"value":     value,
+	})
+	if err != nil {
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) {
+			return nil, &ConfigOptionError{Code: rpcErr.Code, Message: rpcErr.Message}
+		}
+		return nil, fmt.Errorf("%s failed: %w", MethodSessionSetConfigOption, err)
+	}
+	c.setLastConfigOptions(resp.Result)
+	return resp.Result, nil
 }
