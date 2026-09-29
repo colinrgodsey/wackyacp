@@ -106,12 +106,7 @@ func run() error {
 }
 
 func isModelCommand(args []string) bool {
-	for _, a := range args {
-		if a == "model" {
-			return true
-		}
-	}
-	return false
+	return len(args) > 0 && args[0] == "model"
 }
 
 func main() {

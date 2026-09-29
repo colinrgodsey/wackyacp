@@ -261,3 +261,25 @@ func TestCLI_Model_ManifestResolutionAndCWD(t *testing.T) {
 		t.Errorf("expected confirmed model sonnet, got %q", resp3.Model)
 	}
 }
+
+func TestIsModelCommand(t *testing.T) {
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"model", "get"}, true},
+		{[]string{"model", "set", "sonnet"}, true},
+		{[]string{"model"}, true},
+		{[]string{}, false},
+		{[]string{"--harness-args", "model"}, false},
+		{[]string{"--harness-args=model"}, false},
+		{[]string{"--agent-folder", "/foo", "model"}, false},
+		{[]string{"serve", "model"}, false},
+	}
+	for _, tc := range cases {
+		got := isModelCommand(tc.args)
+		if got != tc.want {
+			t.Errorf("isModelCommand(%v) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
