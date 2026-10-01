@@ -93,6 +93,9 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 	if opts.port < 0 {
 		return nil, fmt.Errorf("--port must be non-negative")
 	}
+	if opts.host != "" && opts.port == 0 {
+		return nil, fmt.Errorf("--host with --port 0: port 0 selects stdio mode and --host would be silently ignored; pass a nonzero --port for TCP")
+	}
 	return opts, nil
 }
 
@@ -126,6 +129,13 @@ func runServe(args []string) error {
 
 	dialer := serve.NewDialer(ctx, bin, workspaceDir)
 	defer func() { _ = dialer.Close() }()
+
+	// The child spawns lazily on the first gRPC call (the first
+	// session/prompt or session/load), not at startup or ACP initialize:
+	// gRPC's context dialer fires on first use, and session/new is an
+	// attach, not a spawn. The deferred Close reaps the child on shutdown;
+	// runServeTCP's listener close is what keeps that path reachable from
+	// SIGTERM.
 
 	// The gRPC idle reaper must be disabled (timeout 0): the default 30-minute
 	// idle closed the transport, which EOFs the child stdin and kills it - the
@@ -173,9 +183,22 @@ func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions
 	addr := net.JoinHostPort(host, strconv.Itoa(opts.port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		// The full detail reaches stderr via the returned error (main prints
+		// it); a frontend that then dials the port sees a bare
+		// connection-refused, so this is the only place the reason is visible.
 		return fmt.Errorf("listening on %s: %w", addr, err)
 	}
 	defer func() { _ = ln.Close() }()
+
+	// Accept blocks on a kernel socket and never observes ctx: without this,
+	// SIGTERM is a no-op until the next connect arrives, the supervisor
+	// escalates to SIGKILL, and the defers that reap the child are skipped
+	// - orphaning it. Close the listener on shutdown so Accept returns
+	// immediately and runServe's cleanup runs.
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
 
 	fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s workspace=%s session=%s transport=tcp %s\n",
 		backend.AgentID(), filepath.Dir(backend.AgentFolder()), serve.SessionID(backend.AgentFolder()), ln.Addr().String())
