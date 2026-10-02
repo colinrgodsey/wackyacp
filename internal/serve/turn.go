@@ -17,8 +17,9 @@ import (
 // the wackypub turn stream does not end on its own. It mirrors the reference
 // ACP server's force-cancel grace (30s in claude-agent-acp): a wedged prompt
 // loop must not hold the ACP prompt request forever, but a normal cancel
-// settles well inside the window.
-const forceCancelGrace = 30 * time.Second
+// settles well inside the window. It is a var (not a const) so tests can
+// shorten the window.
+var forceCancelGrace = 30 * time.Second
 
 // Wackypub is the wackypub protocol surface serve mode needs. It is a narrow
 // mirror of agentv1.AgentServiceClient; the generated gRPC client satisfies
@@ -40,8 +41,11 @@ type TurnStream interface {
 // shared conversation, so the Backend admits exactly one turn at a time
 // (second prompters get a structured busy error, the D112 precedent).
 type turnState struct {
-	cancelCh chan struct{} // closed when session/cancel targets this turn
-	owner    *Server       // the ACP connection that started the turn
+	cancelCh   chan struct{} // closed when session/cancel targets this turn
+	cancelOnce sync.Once     // cancel reaches the turn from three paths (cancel
+	// notification, session/close, connection
+	// disconnect); the close must happen exactly once
+	owner *Server // the ACP connection that started the turn
 }
 
 // Backend is the process-wide wackypub side shared by every ACP connection
@@ -119,7 +123,7 @@ func (b *Backend) CancelInFlight(ctx context.Context) bool {
 	if ts == nil {
 		return false
 	}
-	close(ts.cancelCh)
+	ts.cancelOnce.Do(func() { close(ts.cancelCh) })
 	if _, err := b.svc.CancelTurn(ctx, &agentv1.CancelTurnRequest{
 		AgentId:      b.agentID,
 		WorkspaceDir: b.workspaceDir,
@@ -144,7 +148,14 @@ type Usage struct {
 // when the turn failed outside of cancellation. ctx cancellation (client
 // disconnect) also settles the turn as cancelled.
 func (b *Backend) Prompt(ctx context.Context, ts *turnState, promptText string, emit func(Update) error) (stopReason string, usage *Usage, err error) {
-	stream, err := b.svc.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+	// The stream is bound to the turn, not to the ACP connection: when Prompt
+	// returns (finish, error, cancel, or force-cancel) turnCtx is canceled, so
+	// a wedged stream cannot hold the pump goroutine in Recv - CloseSend only
+	// half-closes and never cancels a server-streaming call.
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	defer cancelTurn()
+
+	stream, err := b.svc.AddAndGenerateTurnStream(turnCtx, &agentv1.AddAndGenerateTurnStreamRequest{
 		AgentId:      b.agentID,
 		UserMessage:  promptText,
 		WorkspaceDir: b.workspaceDir,
@@ -171,7 +182,7 @@ func (b *Backend) Prompt(ctx context.Context, ts *turnState, promptText string, 
 			resp, rerr := stream.Recv()
 			select {
 			case msgs <- streamMsg{resp: resp, err: rerr}:
-			case <-ctx.Done():
+			case <-turnCtx.Done():
 				return
 			}
 			if rerr != nil {
@@ -181,6 +192,10 @@ func (b *Backend) Prompt(ctx context.Context, ts *turnState, promptText string, 
 	}()
 
 	canceled := false
+	// A closed channel is ready on every select, so the cancel case is niled
+	// out after its first fire (nil channels never select); the grace timer is
+	// the only pending path left, and it is created exactly once.
+	cancelCh := ts.cancelCh
 	var graceCh <-chan time.Time
 	for {
 		select {
@@ -205,17 +220,17 @@ func (b *Backend) Prompt(ctx context.Context, ts *turnState, promptText string, 
 				usage = u
 			}
 
-		case <-ts.cancelCh:
+		case <-cancelCh:
 			// Give the stream its chance to end on its own (the agent honors
 			// the cancel and closes the turn); the grace timer is the
 			// backstop for a wedged turn (see forceCancelGrace). A stream
 			// that ends after a cancel is a cancelled turn, not a clean one.
 			canceled = true
-			graceTimer := time.NewTimer(forceCancelGrace)
-			graceCh = graceTimer.C
-			defer graceTimer.Stop()
+			cancelCh = nil
+			graceCh = time.NewTimer(forceCancelGrace).C
 
 		case <-graceCh:
+			b.logf("wackyacp serve: force-cancel grace expired for agent %s; abandoning wedged turn", b.agentID)
 			return "cancelled", usage, nil
 		}
 	}

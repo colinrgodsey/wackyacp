@@ -57,8 +57,15 @@ type fakeWackypub struct {
 	readResp  *agentv1.ReadSessionResponse
 	block     *blocker
 
-	starts  int
-	cancels int
+	starts     int
+	cancels    int
+	lastStream *fakeStream
+}
+
+func (f *fakeWackypub) stream() *fakeStream {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastStream
 }
 
 func (f *fakeWackypub) AddAndGenerateTurnStream(ctx context.Context, req *agentv1.AddAndGenerateTurnStreamRequest) (TurnStream, error) {
@@ -70,6 +77,9 @@ func (f *fakeWackypub) AddAndGenerateTurnStream(ctx context.Context, req *agentv
 	f.mu.Unlock()
 
 	st := &fakeStream{ch: make(chan *agentv1.AddAndGenerateTurnStreamResponse, len(script)+1), ctx: ctx}
+	f.mu.Lock()
+	f.lastStream = st
+	f.mu.Unlock()
 	go func() {
 		defer close(st.ch)
 		for _, r := range script {
@@ -713,4 +723,89 @@ func TestUnknownMethodAndMalformedLine(t *testing.T) {
 		return
 	}
 	t.Fatalf("no parse-error frame; scanner: %v", c.scanner.Err())
+}
+
+// TestCancelInFlightIsIdempotent pins the double-cancel safety: the same turn
+// can be cancelled from the session/cancel notification, session/close, and
+// connection disconnect concurrently. Only the first cancel may close the
+// channel; later ones must be no-ops, not a close-of-closed-channel panic.
+func TestCancelInFlightIsIdempotent(t *testing.T) {
+	f := &fakeWackypub{block: &blocker{done: make(chan struct{})}}
+	b := NewBackend("agent1", "/tmp", t.TempDir(), f, nil)
+	ts, ok := b.BeginTurn(nil)
+	if !ok {
+		t.Fatal("BeginTurn")
+	}
+	ctx := context.Background()
+	for i, want := range []bool{true, true, true} {
+		if got := b.CancelInFlight(ctx); got != want {
+			t.Fatalf("cancel %d: got %v want %v", i+1, got, want)
+		}
+	}
+	if f.cancelCount() != 3 {
+		t.Fatalf("each cancel must still send its CancelTurn RPC: got %d", f.cancelCount())
+	}
+	b.EndTurn(ts)
+}
+
+// TestPromptForceCancelFreesStream pins the pump-leak fix: when the
+// force-cancel grace expires on a wedged stream, Prompt must return and the
+// stream must be canceled with it, so the pump goroutine is not left blocked
+// in Recv (CloseSend only half-closes; it never frees a pump).
+func TestPromptForceCancelFreesStream(t *testing.T) {
+	oldGrace := forceCancelGrace
+	forceCancelGrace = 100 * time.Millisecond
+	t.Cleanup(func() { forceCancelGrace = oldGrace })
+
+	f := &fakeWackypub{block: &blocker{done: make(chan struct{})}} // never released: wedged agent
+	b := NewBackend("agent1", "/tmp", t.TempDir(), f, nil)
+	ts, ok := b.BeginTurn(nil)
+	if !ok {
+		t.Fatal("BeginTurn")
+	}
+
+	type promptResult struct {
+		stop string
+		err  error
+	}
+	done := make(chan promptResult, 1)
+	start := time.Now()
+	go func() {
+		stop, _, err := b.Prompt(context.Background(), ts, "hang", func(Update) error { return nil })
+		done <- promptResult{stop, err}
+	}()
+	waitFor(t, "prompt to begin", func() bool { return f.startedTurns() >= 1 })
+	b.CancelInFlight(context.Background())
+
+	var res promptResult
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prompt did not return after the force-cancel grace expired")
+	}
+	elapsed := time.Since(start)
+	if res.stop != "cancelled" || res.err != nil {
+		t.Fatalf("stopReason=%q err=%v, want cancelled/nil", res.stop, res.err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("grace expiry took %v", elapsed)
+	}
+	b.EndTurn(ts)
+
+	// The stream must be canceled: a fresh Recv returns immediately instead of
+	// blocking on the wedged stream, which is what frees the pump.
+	st := f.stream()
+	if st == nil {
+		t.Fatal("no stream recorded")
+	}
+	recvd := make(chan error, 1)
+	go func() { _, rerr := st.Recv(); recvd <- rerr }()
+	select {
+	case rerr := <-recvd:
+		if rerr == nil {
+			t.Fatal("Recv returned a nil error after cancel")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Recv still blocked after Prompt returned: pump goroutine would leak")
+	}
 }
