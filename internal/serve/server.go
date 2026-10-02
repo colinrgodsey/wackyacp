@@ -173,6 +173,13 @@ func (s *Server) handleRequest(ctx context.Context, method string, id json.RawMe
 		s.handleSessionLoad(ctx, id, line)
 	case acp.MethodSessionPrompt:
 		s.handlePrompt(ctx, id, line)
+	case acp.MethodSessionCancel:
+		// The spec defines session/cancel as a notification (handled in
+		// handleNotification), but non-conformant JSON-RPC clients occasionally
+		// send it with an id. Same semantics as the notification form, plus a
+		// response so the client is not left with an unanswered request.
+		s.backend.CancelInFlight(ctx)
+		s.sendResponse(id, map[string]any{}, nil)
 	case acp.MethodSessionClose:
 		if ts := s.backend.ActiveTurn(); ts != nil && ts.owner == s {
 			s.backend.CancelInFlight(ctx)

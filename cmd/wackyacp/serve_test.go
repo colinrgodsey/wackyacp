@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -14,6 +16,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/colinrgodsey/wackyacp/internal/serve"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 var (
@@ -241,4 +246,99 @@ func TestServeTCPShutdownSIGTERM(t *testing.T) {
 		t.Fatalf("orphaned child still running after serve exit: pids %v; stderr: %s", orphans, stderr.String())
 	}
 	t.Logf("no orphaned child after shutdown; stderr: %s", strings.TrimSpace(stderr.String()))
+}
+
+func TestParseServeArgs_DanglingFlagValue(t *testing.T) {
+	// A space-separated flag as the last argument has no value. It must fail
+	// with "flag requires an argument", not be silently ignored: a dangling
+	// --host used to parse as "no TCP host" and --port as port 0 (stdio mode).
+	cases := [][]string{
+		{"--agent-folder", "/tmp/x", "--host"},
+		{"--agent-folder", "/tmp/x", "--port"},
+		{"--agent-folder", "/tmp/x", "--host", "127.0.0.1", "--port"},
+		{"--agent-folder", "/tmp/x", "--wackypub-bin"},
+		{"--agent-folder"},
+	}
+	for _, args := range cases {
+		if _, err := parseServeArgs(args); err == nil || !strings.Contains(err.Error(), "flag requires an argument") {
+			t.Errorf("parseServeArgs(%v): got %v, want flag requires an argument", args, err)
+		}
+	}
+}
+
+// stubWackypub is a serve.Wackypub that never produces a turn: the
+// connection-close test needs no turns at all.
+type stubWackypub struct{}
+
+func (stubWackypub) AddAndGenerateTurnStream(context.Context, *agentv1.AddAndGenerateTurnStreamRequest) (serve.TurnStream, error) {
+	return nil, errors.New("stub: no turns")
+}
+func (stubWackypub) ReadSession(context.Context, *agentv1.ReadSessionRequest) (*agentv1.ReadSessionResponse, error) {
+	return &agentv1.ReadSessionResponse{}, nil
+}
+func (stubWackypub) CancelTurn(context.Context, *agentv1.CancelTurnRequest) (*agentv1.CancelTurnResponse, error) {
+	return &agentv1.CancelTurnResponse{}, nil
+}
+
+// TestRunServeTCPClosesIdleConnsOnShutdown pins the SIGTERM idle-connection
+// fix: when the shutdown context fires, runServeTCP must close the active
+// connections, so an idle scanner.Scan() in the connection handler returns
+// immediately instead of sitting on a dead connection. In-process this is
+// observable as a read that returns a close error right after cancel; before
+// the fix the socket stayed open and the read would time out.
+func TestRunServeTCPClosesIdleConnsOnShutdown(t *testing.T) {
+	b := serve.NewBackend("agent1", "/tmp", t.TempDir(), &stubWackypub{}, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("finding a free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("releasing port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runServeTCP(ctx, b, &serveOptions{host: "127.0.0.1", port: port}) }()
+
+	conn, err := dialUntil(t, "127.0.0.1", port, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dialing serve: %v", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	w := bufio.NewWriter(conn)
+
+	// A completed initialize proves the handler goroutine is live and the
+	// connection is registered for the shutdown close.
+	initRes := acpRequest(t, br, w, 1, "initialize", map[string]any{
+		"protocolVersion":    1,
+		"clientCapabilities": map[string]any{},
+	})
+	if _, ok := initRes["agentCapabilities"]; !ok {
+		t.Fatalf("initialize result missing capabilities: %v", initRes)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runServeTCP: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runServeTCP did not return after ctx cancel")
+	}
+
+	// The idle conn must be interrupted: a read returns a close error
+	// promptly, not a timeout on a still-open socket.
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("setting read deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("idle conn still readable after shutdown; scanner.Scan would not be interrupted")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("conn close not observed: read timed out instead of returning a close error")
+	}
 }

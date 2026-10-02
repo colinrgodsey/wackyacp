@@ -656,6 +656,41 @@ func TestSessionClose(t *testing.T) {
 	}
 }
 
+// TestSessionCancelAsRequest pins the defensive form: a non-conformant
+// client sends session/cancel WITH an id (a request, not a notification).
+// It must be handled exactly like the notification form and answered with
+// an empty object - not dropped and not answered method-not-found.
+func TestSessionCancelAsRequest(t *testing.T) {
+	f := &fakeWackypub{block: &blocker{done: make(chan struct{})}}
+	folder := t.TempDir()
+	b := NewBackend("agent1", filepath.Dir(folder), folder, f, nil)
+	c := startServer(t, b, folder)
+	want := SessionID(folder)
+
+	id1 := c.send(t, acp.MethodSessionPrompt, promptParams(want, "slow"))
+	waitFor(t, "prompt to begin", func() bool { return f.startedTurns() >= 1 })
+
+	cid := c.send(t, acp.MethodSessionCancel, map[string]any{"sessionId": want})
+	res, e := c.readResponse(t, cid)
+	if e != nil {
+		t.Fatalf("cancel-as-request: %+v", e)
+	}
+	if len(res) != 0 {
+		t.Fatalf("cancel-as-request must respond with an empty object, got %v", res)
+	}
+	if f.cancelCount() < 1 {
+		t.Fatal("CancelTurn must have reached the backend")
+	}
+
+	res, e = c.readResponse(t, id1)
+	if e != nil {
+		t.Fatalf("prompt: %+v", e)
+	}
+	if res["stopReason"] != "cancelled" {
+		t.Fatalf("stopReason: got %v want cancelled", res["stopReason"])
+	}
+}
+
 func TestDisconnectCancelsOwnedTurn(t *testing.T) {
 	f := &fakeWackypub{block: &blocker{done: make(chan struct{})}}
 	folder := t.TempDir()

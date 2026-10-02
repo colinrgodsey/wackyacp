@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/colinrgodsey/wackyacp/internal/serve"
@@ -35,24 +36,27 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 		case strings.HasPrefix(arg, "--agent-folder="):
 			opts.agentFolder = strings.TrimPrefix(arg, "--agent-folder=")
 		case arg == "--agent-folder":
-			if i+1 < len(args) {
-				opts.agentFolder = args[i+1]
-				i++
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
 			}
+			opts.agentFolder = args[i+1]
+			i++
 		case strings.HasPrefix(arg, "--wackypub-bin="):
 			opts.wackyPubBin = strings.TrimPrefix(arg, "--wackypub-bin=")
 		case arg == "--wackypub-bin":
-			if i+1 < len(args) {
-				opts.wackyPubBin = args[i+1]
-				i++
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
 			}
+			opts.wackyPubBin = args[i+1]
+			i++
 		case strings.HasPrefix(arg, "--host="):
 			opts.host = strings.TrimPrefix(arg, "--host=")
 		case arg == "--host":
-			if i+1 < len(args) {
-				opts.host = args[i+1]
-				i++
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
 			}
+			opts.host = args[i+1]
+			i++
 		case strings.HasPrefix(arg, "--port="):
 			p, err := strconv.Atoi(strings.TrimPrefix(arg, "--port="))
 			if err != nil {
@@ -60,14 +64,15 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 			}
 			opts.port = p
 		case arg == "--port":
-			if i+1 < len(args) {
-				p, err := strconv.Atoi(args[i+1])
-				if err != nil {
-					return nil, fmt.Errorf("invalid --port: %s", args[i+1])
-				}
-				opts.port = p
-				i++
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
 			}
+			p, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid --port: %s", args[i+1])
+			}
+			opts.port = p
+			i++
 		case strings.HasPrefix(arg, "-"):
 			return nil, fmt.Errorf("unknown flag: %s", arg)
 		default:
@@ -190,14 +195,39 @@ func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions
 	}
 	defer func() { _ = ln.Close() }()
 
+	// Active connections, so shutdown can close them. A connection handler
+	// blocks in scanner.Scan() on the socket and never observes ctx; leaving
+	// the socket open on shutdown leaves that read pending on a dead
+	// connection. Closing it makes the read return immediately.
+	var (
+		connMu sync.Mutex
+		conns  []net.Conn
+	)
+	removeConn := func(c net.Conn) {
+		connMu.Lock()
+		for i, cc := range conns {
+			if cc == c {
+				conns = append(conns[:i], conns[i+1:]...)
+			}
+		}
+		connMu.Unlock()
+	}
+
 	// Accept blocks on a kernel socket and never observes ctx: without this,
 	// SIGTERM is a no-op until the next connect arrives, the supervisor
 	// escalates to SIGKILL, and the defers that reap the child are skipped
 	// - orphaning it. Close the listener on shutdown so Accept returns
-	// immediately and runServe's cleanup runs.
+	// immediately and runServe's cleanup runs, and close the active
+	// connections so their idle scanner reads are interrupted with it.
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
+		connMu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		conns = nil
+		connMu.Unlock()
 	}()
 
 	fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s workspace=%s session=%s transport=tcp %s\n",
@@ -212,12 +242,16 @@ func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions
 			fmt.Fprintf(os.Stderr, "wackyacp serve: accept: %v\n", err)
 			continue
 		}
+		connMu.Lock()
+		conns = append(conns, conn)
+		connMu.Unlock()
 		go func() {
 			srv := serve.NewServer(conn, conn, backend, backend.AgentFolder())
-			if err := srv.Serve(ctx); err != nil {
+			if err := srv.Serve(ctx); err != nil && ctx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "wackyacp serve: connection: %v\n", err)
 			}
 			_ = conn.Close()
+			removeConn(conn)
 		}()
 	}
 }
