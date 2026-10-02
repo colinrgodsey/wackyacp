@@ -23,6 +23,11 @@ type Config struct {
 	AgentFolder string
 	Stderr      io.Writer
 	WaitDelay   time.Duration
+
+	// OAuthLockStaleThreshold overrides DefaultOAuthLockStaleThreshold.
+	OAuthLockStaleThreshold time.Duration
+	// ClaudeDir overrides the Claude configuration directory to probe.
+	ClaudeDir string
 }
 
 // Process wraps the running harness subprocess.
@@ -54,6 +59,15 @@ func Start(ctx context.Context, cfg Config) (*Process, error) {
 	binPath, err := Resolve(cfg.Command)
 	if err != nil {
 		return nil, err
+	}
+
+	// Reclaim any stale OAuth refresh locks before spawning the harness subprocess
+	if _, err := RecoverStaleOAuthLock(cfg); err != nil {
+		stderr := cfg.Stderr
+		if stderr == nil {
+			stderr = os.Stderr
+		}
+		fmt.Fprintf(stderr, "wackyacp: warning: checking oauth refresh lock: %v\n", err)
 	}
 
 	procCtx, procCancel := context.WithCancel(ctx)
