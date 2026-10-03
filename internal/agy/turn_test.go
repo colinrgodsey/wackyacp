@@ -149,6 +149,93 @@ func TestPromptArgvGainsConversationAndModel(t *testing.T) {
 	}
 }
 
+func TestPromptModelSlashCommand(t *testing.T) {
+	env := newTestEnv(t)
+	runner := &scriptRunner{}
+	h := startBridge(t, env, runner)
+
+	if err := os.WriteFile(filepath.Join(env.stateDir, "models_cache.json"), []byte("[\"gemini-3.1-pro-high\\tGemini 3.1 Pro (High)\", \"gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\"]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := newSession(t, h)
+
+	// 1. Query via prompt "/model"
+	resp := h.responseFor(promptID(h, sessionID, "/model"))
+	if got := stopReason(t, resp); got != StopReasonEndTurn {
+		t.Fatalf("query stopReason = %q, want %q", got, StopReasonEndTurn)
+	}
+	updates := h.updates()
+	var textFound string
+	for _, u := range updates {
+		if u.Content != nil {
+			textFound += u.Content.Text
+		}
+	}
+	if !strings.Contains(textFound, "Current model: **gemini-3.1-pro-high** (Gemini 3.1 Pro (High))") {
+		t.Errorf("expected current model in updates, got: %s", textFound)
+	}
+	if !strings.Contains(textFound, "• **gemini-3.8-flash-high** — Gemini 3.8 Flash (High)") {
+		t.Errorf("expected flash option in updates, got: %s", textFound)
+	}
+	if runner.count() != 0 {
+		t.Errorf("runner should not have been invoked for /model query, got %d", runner.count())
+	}
+
+	// 2. Set model via prompt "/model gemini-3.8-flash-high"
+	respSet := h.responseFor(promptID(h, sessionID, "/model gemini-3.8-flash-high"))
+	if got := stopReason(t, respSet); got != StopReasonEndTurn {
+		t.Fatalf("set stopReason = %q, want %q", got, StopReasonEndTurn)
+	}
+	updatesAfter := h.updates()
+	var setTextFound string
+	for _, u := range updatesAfter[len(updates):] {
+		if u.Content != nil {
+			setTextFound += u.Content.Text
+		}
+	}
+	if !strings.Contains(setTextFound, "Model set to **gemini-3.8-flash-high** (Gemini 3.8 Flash (High)).") {
+		t.Errorf("expected confirmation in updates, got: %s", setTextFound)
+	}
+	if runner.count() != 0 {
+		t.Errorf("runner should not have been invoked for /model set, got %d", runner.count())
+	}
+
+	// 3. Regular prompt now carries the updated model to agy CLI
+	runner.add(func(context.Context, []string) error { return nil })
+	mustOK(t, h.responseFor(promptID(h, sessionID, "regular prompt")))
+	if runner.count() != 1 {
+		t.Fatalf("runner should have been invoked 1 time, got %d", runner.count())
+	}
+	cmdArgs := strings.Join(runner.argvAt(t, 0), " ")
+	if !strings.Contains(cmdArgs, "--model gemini-3.8-flash-high") {
+		t.Errorf("expected --model gemini-3.8-flash-high in argv, got: %s", cmdArgs)
+	}
+
+	// 4. Prompt with unknown model emits error message and does not alter session model
+	respErr := h.responseFor(promptID(h, sessionID, "/model bogus-model"))
+	if got := stopReason(t, respErr); got != StopReasonEndTurn {
+		t.Fatalf("set error stopReason = %q, want %q", got, StopReasonEndTurn)
+	}
+	updatesErr := h.updates()
+	var errTextFound string
+	for _, u := range updatesErr[len(updatesAfter):] {
+		if u.Content != nil {
+			errTextFound += u.Content.Text
+		}
+	}
+	if !strings.Contains(errTextFound, "Failed to set model to \"bogus-model\": unknown model: bogus-model") {
+		t.Errorf("expected error message in updates, got: %s", errTextFound)
+	}
+	if runner.count() != 1 {
+		t.Errorf("runner count should not increase on rejected model prompt, got %d", runner.count())
+	}
+	storedSessions, _ := NewStore(env.stateDir).Read()
+	if storedSessions[sessionID].ModelID != "gemini-3.8-flash-high" {
+		t.Errorf("session model should remain gemini-3.8-flash-high, got: %q", storedSessions[sessionID].ModelID)
+	}
+}
+
 func TestExtraArgsAndPrintTimeoutArePassedThrough(t *testing.T) {
 	env := newTestEnv(t)
 	runner := &scriptRunner{}
@@ -328,19 +415,38 @@ func TestSetConfigOptionValidation(t *testing.T) {
 		"sessionId": sessionID, "configId": "model",
 	})), CodeInvalidParams)
 
-	// The snake_case alias the reference bridge also answers must work.
+	// Unknown model is rejected when no models are available
+	mustFail(t, h.responseFor(h.request("session/setConfigOption", map[string]string{
+		"sessionId": sessionID, "configId": "model", "value": "Some Model",
+	})), CodeInvalidParams)
+
+	// Populate known models cache
+	if err := os.WriteFile(filepath.Join(env.stateDir, "models_cache.json"), []byte("[\"some-model\\tSome Model\"]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unknown model is rejected with CodeInvalidParams and descriptive error message
+	unknownResp := h.responseFor(h.request("session/setConfigOption", map[string]string{
+		"sessionId": sessionID, "configId": "model", "value": "bogus-model",
+	}))
+	mustFail(t, unknownResp, CodeInvalidParams)
+	if unknownResp.Error == nil || !strings.Contains(unknownResp.Error.Message, "unknown model: bogus-model") {
+		t.Fatalf("expected unknown model message, got: %+v", unknownResp.Error)
+	}
+
+	// The snake_case alias the reference bridge also answers must work for a known model.
 	msg := h.responseFor(h.request("session/set_config_option", map[string]string{
 		"sessionId": sessionID, "configId": "model", "value": "Some Model",
 	}))
 	mustOK(t, msg)
 
-	// The selection must survive into the state the next turn reads.
+	// The selection must survive into the state the next turn reads (canonical machine ID).
 	sessions, err := NewStore(env.stateDir).Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sessions[sessionID].ModelID != "Some Model" {
-		t.Fatalf("persisted model = %q, want Some Model", sessions[sessionID].ModelID)
+	if sessions[sessionID].ModelID != "some-model" {
+		t.Fatalf("persisted model = %q, want some-model", sessions[sessionID].ModelID)
 	}
 }
 

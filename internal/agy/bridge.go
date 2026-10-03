@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/colinrgodsey/wackyacp/internal/acp"
 )
 
 // Permission postures accepted by Config.PermissionMode. They mirror wackyacp's own
@@ -335,6 +337,45 @@ func (b *Bridge) handleSessionPrompt(ctx context.Context, req request) {
 		return
 	}
 
+	if isModel, target, isQuery := acp.IsModelSlashCommand(promptText); isModel {
+		defer cancelTurn()
+		defer b.unregisterTurn(turn)
+
+		var text string
+		if isQuery {
+			opts := b.models.ConfigOptions(turnCtx, sess.ModelID)
+			info := acp.ExtractModelInfo(opts, sess.ModelID)
+			text = acp.FormatModelList(info)
+		} else {
+			canonicalID, ok := b.models.Lookup(turnCtx, target)
+			if !ok {
+				text = acp.FormatModelSetError(target, fmt.Errorf("unknown model: %s", target))
+			} else {
+				sess.ModelID = canonicalID
+				b.setSession(params.SessionID, sess)
+				if err := b.store.Write(params.SessionID, sess); err != nil {
+					b.logf("persisting session %s: %v", params.SessionID, err)
+				}
+				opts := b.models.ConfigOptions(turnCtx, sess.ModelID)
+				info := acp.ExtractModelInfo(opts, sess.ModelID)
+				text = acp.FormatModelSetSuccess(sess.ModelID, info)
+			}
+		}
+
+		_ = b.notify("session/update", map[string]any{
+			"sessionId": params.SessionID,
+			"update": Update{
+				SessionUpdate: updateMessageChunk,
+				Content: &Content{
+					Type: "text",
+					Text: text,
+				},
+			},
+		})
+		b.respond(req.ID, map[string]any{"stopReason": StopReasonEndTurn})
+		return
+	}
+
 	b.handlers.Add(1)
 	go func() {
 		defer b.handlers.Done()
@@ -410,7 +451,13 @@ func (b *Bridge) handleSetConfigOption(ctx context.Context, req request) {
 		return
 	}
 
-	sess.ModelID = b.models.CanonicalID(params.Value)
+	canonicalID, ok := b.models.Lookup(ctx, params.Value)
+	if !ok {
+		b.respondError(req.ID, CodeInvalidParams, fmt.Sprintf("unknown model: %s", params.Value))
+		return
+	}
+
+	sess.ModelID = canonicalID
 	b.setSession(params.SessionID, sess)
 	if err := b.store.Write(params.SessionID, sess); err != nil {
 		b.respondError(req.ID, CodeServerFailure, fmt.Sprintf("persisting session %s: %v", params.SessionID, err))

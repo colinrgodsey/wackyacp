@@ -104,65 +104,8 @@ func parseModelArgs(args []string) (*modelOptions, error) {
 }
 
 func extractModelInfo(raw json.RawMessage, fallback string) (string, any) {
-	if len(raw) == 0 {
-		return fallback, []any{}
-	}
-
-	var parsed any
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return fallback, raw
-	}
-
-	var optionsList []any
-	if obj, ok := parsed.(map[string]any); ok {
-		if co, exists := obj["configOptions"]; exists {
-			if list, ok := co.([]any); ok {
-				optionsList = list
-			}
-		}
-	} else if list, ok := parsed.([]any); ok {
-		optionsList = list
-	}
-
-	model := ""
-	for _, item := range optionsList {
-		if m, ok := item.(map[string]any); ok {
-			id, _ := m["id"].(string)
-			key, _ := m["key"].(string)
-			cat, _ := m["category"].(string)
-			if id == "model" || key == "model" || cat == "model" {
-				if cv, ok := m["currentValue"].(string); ok && cv != "" {
-					model = cv
-					break
-				}
-				if sel, ok := m["selected"].(string); ok && sel != "" {
-					model = sel
-					break
-				}
-				if val, ok := m["value"].(string); ok && val != "" {
-					model = val
-					break
-				}
-				if opts, ok := m["options"].([]any); ok && len(opts) > 0 {
-					if first, ok := opts[0].(map[string]any); ok {
-						if v, ok := first["value"].(string); ok && v != "" {
-							model = v
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-
-	if model == "" {
-		model = fallback
-	}
-
-	if len(optionsList) > 0 {
-		return model, optionsList
-	}
-	return model, parsed
+	info := acp.ExtractModelInfo(raw, fallback)
+	return info.CurrentModel, info.RawOptions
 }
 
 func runModel(args []string) error {

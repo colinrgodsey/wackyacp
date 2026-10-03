@@ -45,8 +45,15 @@ func NewModelProvider(agyBin, stateDir string, logf func(format string, args ...
 func (m *ModelProvider) Models(ctx context.Context) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.discovered {
+	if len(m.resolved) > 0 {
 		return m.resolved
+	}
+	if m.discovered {
+		if cached := m.loadCache(); len(cached) > 0 {
+			m.resolved = cached
+			return m.resolved
+		}
+		return nil
 	}
 	m.discovered = true
 
@@ -125,6 +132,27 @@ func (m *ModelProvider) CanonicalID(value string) string {
 		}
 	}
 	return value
+}
+
+// Lookup validates value against the known models, matching either the machine id
+// or display name (including case-insensitive matching). If found, it returns
+// the stable machine id and true. If unknown or if no models are available, it
+// returns "", false.
+func (m *ModelProvider) Lookup(ctx context.Context, value string) (string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	val := modelID(value)
+	if val == "" {
+		return "", false
+	}
+	for _, entry := range m.Models(ctx) {
+		id, name := splitModelEntry(entry)
+		if val == id || val == name || strings.EqualFold(val, id) || strings.EqualFold(val, name) {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // modelID returns the machine id from an entry that may carry a display name
