@@ -52,3 +52,10 @@ const (
 	CodeInvalidParams  = -32602
 	CodeInternalError  = -32603
 )
+
+// ACP methods and update kinds used by serve mode (the ACP server face).
+const (
+	MethodSessionClose          = "session/close"
+	UpdateKindUserMessageChunk  = "user_message_chunk"
+	UpdateKindAgentThoughtChunk = "agent_thought_chunk"
+)

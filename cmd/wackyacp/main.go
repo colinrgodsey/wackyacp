@@ -105,6 +105,10 @@ func run() error {
 	return nil
 }
 
+func isServeCommand(args []string) bool {
+	return len(args) > 0 && args[0] == "serve"
+}
+
 func isModelCommand(args []string) bool {
 	return len(args) > 0 && args[0] == "model"
 }
@@ -112,6 +116,14 @@ func isModelCommand(args []string) bool {
 func main() {
 	if isModelCommand(os.Args[1:]) {
 		if err := runModel(os.Args[1:]); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if isServeCommand(os.Args[1:]) {
+		if err := runServe(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "wackyacp: %v\n", err)
 			os.Exit(1)
 		}
 		return
