@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/colinrgodsey/wackyacp/internal/acp"
 )
 
 // Permission postures accepted by Config.PermissionMode. They mirror wackyacp's own
@@ -332,6 +334,40 @@ func (b *Bridge) handleSessionPrompt(ctx context.Context, req request) {
 	if !ok {
 		cancelTurn()
 		b.respondError(req.ID, CodeServerFailure, fmt.Sprintf("turn already in progress for sessionId: %s", params.SessionID))
+		return
+	}
+
+	if isModel, target, isQuery := acp.IsModelSlashCommand(promptText); isModel {
+		defer cancelTurn()
+		defer b.unregisterTurn(turn)
+
+		var text string
+		if isQuery {
+			opts := b.models.ConfigOptions(turnCtx, sess.ModelID)
+			info := acp.ExtractModelInfo(opts, sess.ModelID)
+			text = acp.FormatModelList(info)
+		} else {
+			sess.ModelID = b.models.CanonicalID(target)
+			b.setSession(params.SessionID, sess)
+			if err := b.store.Write(params.SessionID, sess); err != nil {
+				b.logf("persisting session %s: %v", params.SessionID, err)
+			}
+			opts := b.models.ConfigOptions(turnCtx, sess.ModelID)
+			info := acp.ExtractModelInfo(opts, sess.ModelID)
+			text = acp.FormatModelSetSuccess(sess.ModelID, info)
+		}
+
+		_ = b.notify("session/update", map[string]any{
+			"sessionId": params.SessionID,
+			"update": Update{
+				SessionUpdate: updateMessageChunk,
+				Content: &Content{
+					Type: "text",
+					Text: text,
+				},
+			},
+		})
+		b.respond(req.ID, map[string]any{"stopReason": StopReasonEndTurn})
 		return
 	}
 

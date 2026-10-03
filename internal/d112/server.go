@@ -2,6 +2,7 @@ package d112
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -19,6 +20,8 @@ import (
 type ACPDriver interface {
 	Prompt(ctx context.Context, sessionID, promptText string, callbacks acp.TurnCallbacks) (*acp.PromptResult, error)
 	Cancel(sessionID string) error
+	SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error)
+	LastConfigOptions() json.RawMessage
 }
 
 // Server implements agentv1.AgentServiceServer for wackyacp.
@@ -167,6 +170,13 @@ func (s *Server) AddAndGenerateTurnStream(req *agentv1.AddAndGenerateTurnStreamR
 	}()
 	promptText := req.GetUserMessage()
 
+	if isModel, target, isQuery := acp.IsModelSlashCommand(promptText); isModel {
+		msg := s.handleModelCommand(ctx, target, isQuery)
+		return stream.Send(&agentv1.AddAndGenerateTurnStreamResponse{
+			Text: msg,
+		})
+	}
+
 	callbacks := acp.TurnCallbacks{
 		OnChunk: func(text string) error {
 			return stream.Send(&agentv1.AddAndGenerateTurnStreamResponse{
@@ -247,6 +257,15 @@ func (s *Server) AddAndGenerateTurn(ctx context.Context, req *agentv1.AddAndGene
 			_ = s.driver.Cancel(s.sessionID)
 		}
 	}()
+
+	promptText := req.GetUserMessage()
+	if isModel, target, isQuery := acp.IsModelSlashCommand(promptText); isModel {
+		msg := s.handleModelCommand(ctx, target, isQuery)
+		return &agentv1.AddAndGenerateTurnResponse{
+			Text: msg,
+		}, nil
+	}
+
 	var sb strings.Builder
 	var warnings []string
 
@@ -261,7 +280,7 @@ func (s *Server) AddAndGenerateTurn(ctx context.Context, req *agentv1.AddAndGene
 		},
 	}
 
-	res, err := s.driver.Prompt(ctx, s.sessionID, req.GetUserMessage(), callbacks)
+	res, err := s.driver.Prompt(ctx, s.sessionID, promptText, callbacks)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -271,6 +290,29 @@ func (s *Server) AddAndGenerateTurn(ctx context.Context, req *agentv1.AddAndGene
 		Warnings: warnings,
 		Usage:    toProtoUsage(res.Usage),
 	}, nil
+}
+
+func (s *Server) handleModelCommand(ctx context.Context, targetModel string, isQuery bool) string {
+	if isQuery {
+		raw := s.driver.LastConfigOptions()
+		info := acp.ExtractModelInfo(raw, "")
+		return acp.FormatModelList(info)
+	}
+
+	rawResult, err := s.driver.SetConfigOption(ctx, s.sessionID, "model", targetModel)
+	if err != nil {
+		return acp.FormatModelSetError(targetModel, err)
+	}
+
+	info := acp.ExtractModelInfo(rawResult, targetModel)
+	if len(info.Options) == 0 {
+		info = acp.ExtractModelInfo(s.driver.LastConfigOptions(), targetModel)
+	}
+	confirmed := info.CurrentModel
+	if confirmed == "" {
+		confirmed = targetModel
+	}
+	return acp.FormatModelSetSuccess(confirmed, info)
 }
 
 // AsideQuestion implements agentv1.AgentServiceServer. ACP bridged harnesses (agy via

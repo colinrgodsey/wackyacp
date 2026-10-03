@@ -149,6 +149,70 @@ func TestPromptArgvGainsConversationAndModel(t *testing.T) {
 	}
 }
 
+func TestPromptModelSlashCommand(t *testing.T) {
+	env := newTestEnv(t)
+	runner := &scriptRunner{}
+	h := startBridge(t, env, runner)
+
+	if err := os.WriteFile(filepath.Join(env.stateDir, "models_cache.json"), []byte("[\"gemini-3.1-pro-high\\tGemini 3.1 Pro (High)\", \"gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\"]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := newSession(t, h)
+
+	// 1. Query via prompt "/model"
+	resp := h.responseFor(promptID(h, sessionID, "/model"))
+	if got := stopReason(t, resp); got != StopReasonEndTurn {
+		t.Fatalf("query stopReason = %q, want %q", got, StopReasonEndTurn)
+	}
+	updates := h.updates()
+	var textFound string
+	for _, u := range updates {
+		if u.Content != nil {
+			textFound += u.Content.Text
+		}
+	}
+	if !strings.Contains(textFound, "Current model: **gemini-3.1-pro-high** (Gemini 3.1 Pro (High))") {
+		t.Errorf("expected current model in updates, got: %s", textFound)
+	}
+	if !strings.Contains(textFound, "• **gemini-3.8-flash-high** — Gemini 3.8 Flash (High)") {
+		t.Errorf("expected flash option in updates, got: %s", textFound)
+	}
+	if runner.count() != 0 {
+		t.Errorf("runner should not have been invoked for /model query, got %d", runner.count())
+	}
+
+	// 2. Set model via prompt "/model gemini-3.8-flash-high"
+	respSet := h.responseFor(promptID(h, sessionID, "/model gemini-3.8-flash-high"))
+	if got := stopReason(t, respSet); got != StopReasonEndTurn {
+		t.Fatalf("set stopReason = %q, want %q", got, StopReasonEndTurn)
+	}
+	updatesAfter := h.updates()
+	var setTextFound string
+	for _, u := range updatesAfter[len(updates):] {
+		if u.Content != nil {
+			setTextFound += u.Content.Text
+		}
+	}
+	if !strings.Contains(setTextFound, "Model set to **gemini-3.8-flash-high** (Gemini 3.8 Flash (High)).") {
+		t.Errorf("expected confirmation in updates, got: %s", setTextFound)
+	}
+	if runner.count() != 0 {
+		t.Errorf("runner should not have been invoked for /model set, got %d", runner.count())
+	}
+
+	// 3. Regular prompt now carries the updated model to agy CLI
+	runner.add(func(context.Context, []string) error { return nil })
+	mustOK(t, h.responseFor(promptID(h, sessionID, "regular prompt")))
+	if runner.count() != 1 {
+		t.Fatalf("runner should have been invoked 1 time, got %d", runner.count())
+	}
+	cmdArgs := strings.Join(runner.argvAt(t, 0), " ")
+	if !strings.Contains(cmdArgs, "--model gemini-3.8-flash-high") {
+		t.Errorf("expected --model gemini-3.8-flash-high in argv, got: %s", cmdArgs)
+	}
+}
+
 func TestExtraArgsAndPrintTimeoutArePassedThrough(t *testing.T) {
 	env := newTestEnv(t)
 	runner := &scriptRunner{}

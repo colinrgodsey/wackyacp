@@ -849,6 +849,102 @@ func TestWackyacp_E2E_ToolCallStreaming(t *testing.T) {
 	}
 }
 
+func TestE2E_ModelSlashCommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	agentFolder := newTestAgentFolder(t)
+	client, cleanup := spawnBridge(t, ctx, agentFolder, "echo")
+	defer cleanup()
+
+	// 1. Query model via /model
+	stream, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream(/model) failed: %v", err)
+	}
+
+	var textParts []string
+	for {
+		resp, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream recv failed: %v", err)
+		}
+		if resp.Text != "" {
+			textParts = append(textParts, resp.Text)
+		}
+	}
+
+	fullQueryText := strings.Join(textParts, "")
+	if !strings.Contains(fullQueryText, "Current model:") {
+		t.Errorf("expected Current model in /model output, got: %s", fullQueryText)
+	}
+	if !strings.Contains(fullQueryText, "sonnet") || !strings.Contains(fullQueryText, "opus") {
+		t.Errorf("expected model choices in /model output, got: %s", fullQueryText)
+	}
+
+	// 2. Set model via /model sonnet
+	streamSet, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model sonnet",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream(/model sonnet) failed: %v", err)
+	}
+
+	textParts = nil
+	for {
+		resp, err := streamSet.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream recv failed: %v", err)
+		}
+		if resp.Text != "" {
+			textParts = append(textParts, resp.Text)
+		}
+	}
+
+	fullSetText := strings.Join(textParts, "")
+	if !strings.Contains(fullSetText, "Model set to **sonnet**") {
+		t.Errorf("expected model set confirmation, got: %s", fullSetText)
+	}
+
+	// 3. Set unknown model surfaces harness error
+	streamErr, err := client.AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model unknown-model",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream(/model unknown-model) failed: %v", err)
+	}
+
+	textParts = nil
+	for {
+		resp, err := streamErr.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream recv should not fail with RPC error on invalid model set, got: %v", err)
+		}
+		if resp.Text != "" {
+			textParts = append(textParts, resp.Text)
+		}
+	}
+
+	fullErrText := strings.Join(textParts, "")
+	if !strings.Contains(fullErrText, "Failed to set model to \"unknown-model\"") {
+		t.Errorf("expected error message in output, got: %s", fullErrText)
+	}
+}
+
 func TestZZZ_Canary_NoOrphanProcesses(t *testing.T) {
 	// Assert no stray wackyacp or harness processes tagged with e2eMarker remain after the suite
 	strays, err := sweepProcesses(e2eMarker)
