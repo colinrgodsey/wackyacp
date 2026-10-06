@@ -185,6 +185,7 @@ func TestStubSwallowedErrorIsReported(t *testing.T) {
 }
 
 func TestStubReceivesModelAndPromptInArgv(t *testing.T) {
+	t.Setenv("STUB_MODELS", "Gemini 3.1 Pro (High)")
 	env, h := stubEnv(t, "stream")
 	argvLog := filepath.Join(env.workDir, "argv.log")
 	t.Setenv("STUB_ARGV_LOG", argvLog)

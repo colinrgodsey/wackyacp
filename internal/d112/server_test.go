@@ -2,6 +2,7 @@ package d112
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -28,9 +29,19 @@ type mockACPDriver struct {
 	promptHook        func(ctx context.Context)
 	cancelCh          chan string
 	canceledSessionID string
+	lastConfigOpts    json.RawMessage
+	setConfigResp     json.RawMessage
+	setConfigErr      error
+	lastSetConfigCall struct {
+		sessionID string
+		configID  string
+		value     string
+	}
+	promptCallCount int
 }
 
 func (m *mockACPDriver) Prompt(ctx context.Context, sessionID, promptText string, callbacks acp.TurnCallbacks) (*acp.PromptResult, error) {
+	m.promptCallCount++
 	if m.promptHook != nil {
 		m.promptHook(ctx)
 	}
@@ -72,6 +83,20 @@ func (m *mockACPDriver) Cancel(sessionID string) error {
 		m.cancelCh <- sessionID
 	}
 	return nil
+}
+
+func (m *mockACPDriver) SetConfigOption(ctx context.Context, sessionID, configID, value string) (json.RawMessage, error) {
+	m.lastSetConfigCall.sessionID = sessionID
+	m.lastSetConfigCall.configID = configID
+	m.lastSetConfigCall.value = value
+	if m.setConfigErr != nil {
+		return nil, m.setConfigErr
+	}
+	return m.setConfigResp, nil
+}
+
+func (m *mockACPDriver) LastConfigOptions() json.RawMessage {
+	return m.lastConfigOpts
 }
 
 func setupTestServer(driver ACPDriver) (agentv1.AgentServiceClient, func()) {
@@ -459,4 +484,203 @@ func TestD112_ToolCallStreaming(t *testing.T) {
 			t.Errorf("unexpected ToolCallUpdate: %+v", gotUpdate)
 		}
 	})
+}
+
+func TestAddAndGenerateTurnStream_ModelQuery(t *testing.T) {
+	driver := &mockACPDriver{
+		lastConfigOpts: json.RawMessage(`[
+			{
+				"id": "model",
+				"currentValue": "sonnet",
+				"options": [
+					{"value": "sonnet", "name": "Claude 3.5 Sonnet"},
+					{"value": "opus", "name": "Claude 3 Opus"}
+				]
+			}
+		]`),
+	}
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	stream, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	var textParts []string
+	for {
+		resp, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream recv failed: %v", err)
+		}
+		if resp.Text != "" {
+			textParts = append(textParts, resp.Text)
+		}
+	}
+
+	if driver.promptCallCount != 0 {
+		t.Errorf("driver.Prompt should not be called for /model query, got %d calls", driver.promptCallCount)
+	}
+
+	fullText := strings.Join(textParts, "")
+	if !strings.Contains(fullText, "Current model: **sonnet** (Claude 3.5 Sonnet)") {
+		t.Errorf("expected current model in output, got: %s", fullText)
+	}
+	if !strings.Contains(fullText, "• **opus** — Claude 3 Opus") {
+		t.Errorf("expected opus option in output, got: %s", fullText)
+	}
+}
+
+func TestAddAndGenerateTurnStream_ModelSetSuccess(t *testing.T) {
+	driver := &mockACPDriver{
+		setConfigResp: json.RawMessage(`[
+			{
+				"id": "model",
+				"currentValue": "opus",
+				"options": [
+					{"value": "sonnet", "name": "Claude 3.5 Sonnet"},
+					{"value": "opus", "name": "Claude 3 Opus"}
+				]
+			}
+		]`),
+	}
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	stream, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model opus",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	var textParts []string
+	for {
+		resp, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream recv failed: %v", err)
+		}
+		if resp.Text != "" {
+			textParts = append(textParts, resp.Text)
+		}
+	}
+
+	if driver.promptCallCount != 0 {
+		t.Errorf("driver.Prompt should not be called for /model set, got %d calls", driver.promptCallCount)
+	}
+	if driver.lastSetConfigCall.sessionID != "test-session-123" {
+		t.Errorf("sessionID = %q, want test-session-123", driver.lastSetConfigCall.sessionID)
+	}
+	if driver.lastSetConfigCall.configID != "model" {
+		t.Errorf("configID = %q, want model", driver.lastSetConfigCall.configID)
+	}
+	if driver.lastSetConfigCall.value != "opus" {
+		t.Errorf("value = %q, want opus", driver.lastSetConfigCall.value)
+	}
+
+	fullText := strings.Join(textParts, "")
+	if fullText != "Model set to **opus** (Claude 3 Opus)." {
+		t.Errorf("unexpected output: %q", fullText)
+	}
+}
+
+func TestAddAndGenerateTurnStream_ModelSetError(t *testing.T) {
+	driver := &mockACPDriver{
+		setConfigErr: &acp.ConfigOptionError{
+			Code:    -32602,
+			Message: "unknown model: bad-model",
+		},
+	}
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	stream, err := client.AddAndGenerateTurnStream(context.Background(), &agentv1.AddAndGenerateTurnStreamRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model bad-model",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurnStream failed: %v", err)
+	}
+
+	var textParts []string
+	for {
+		resp, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream recv should not fail with RPC error on set error, got: %v", err)
+		}
+		if resp.Text != "" {
+			textParts = append(textParts, resp.Text)
+		}
+	}
+
+	fullText := strings.Join(textParts, "")
+	if !strings.Contains(fullText, "Failed to set model to \"bad-model\": unknown model: bad-model") {
+		t.Errorf("expected error message in text stream, got: %q", fullText)
+	}
+}
+
+func TestAddAndGenerateTurn_ModelUnary(t *testing.T) {
+	driver := &mockACPDriver{
+		lastConfigOpts: json.RawMessage(`[
+			{
+				"id": "model",
+				"currentValue": "sonnet",
+				"options": [
+					{"value": "sonnet", "name": "Claude 3.5 Sonnet"}
+				]
+			}
+		]`),
+		setConfigResp: json.RawMessage(`[
+			{
+				"id": "model",
+				"currentValue": "sonnet",
+				"options": [
+					{"value": "sonnet", "name": "Claude 3.5 Sonnet"}
+				]
+			}
+		]`),
+	}
+	client, cleanup := setupTestServer(driver)
+	defer cleanup()
+
+	// Query via unary AddAndGenerateTurn
+	respQuery, err := client.AddAndGenerateTurn(context.Background(), &agentv1.AddAndGenerateTurnRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurn query failed: %v", err)
+	}
+	if !strings.Contains(respQuery.Text, "Current model: **sonnet** (Claude 3.5 Sonnet)") {
+		t.Errorf("unexpected query text: %q", respQuery.Text)
+	}
+
+	// Set via unary AddAndGenerateTurn
+	respSet, err := client.AddAndGenerateTurn(context.Background(), &agentv1.AddAndGenerateTurnRequest{
+		AgentId:     "test-agent",
+		UserMessage: "/model set sonnet",
+	})
+	if err != nil {
+		t.Fatalf("AddAndGenerateTurn set failed: %v", err)
+	}
+	if respSet.Text != "Model set to **sonnet** (Claude 3.5 Sonnet)." {
+		t.Errorf("unexpected set text: %q", respSet.Text)
+	}
+
+	if driver.promptCallCount != 0 {
+		t.Errorf("driver.Prompt should not be called, got %d calls", driver.promptCallCount)
+	}
 }

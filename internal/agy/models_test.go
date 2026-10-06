@@ -266,3 +266,44 @@ func TestConfigOptionsAreEmptyWhenNothingIsKnown(t *testing.T) {
 		t.Fatalf("CanonicalID = %q, want it passed through when no list exists", got)
 	}
 }
+
+func TestModelProviderLookup(t *testing.T) {
+	stub := &fetchStub{got: []string{
+		"claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)",
+		"gemini-3.1-pro-high\tGemini 3.1 Pro (High)",
+	}}
+	provider, _ := newTestProvider(t, stub.fetch)
+
+	ctx := context.Background()
+
+	// Exact machine id
+	if id, ok := provider.Lookup(ctx, "claude-sonnet-4-6"); !ok || id != "claude-sonnet-4-6" {
+		t.Errorf("Lookup(claude-sonnet-4-6) = (%q, %v), want (claude-sonnet-4-6, true)", id, ok)
+	}
+
+	// Exact display name
+	if id, ok := provider.Lookup(ctx, "Claude Sonnet 4.6 (Thinking)"); !ok || id != "claude-sonnet-4-6" {
+		t.Errorf("Lookup(Claude Sonnet 4.6 (Thinking)) = (%q, %v), want (claude-sonnet-4-6, true)", id, ok)
+	}
+
+	// Case-insensitive display name
+	if id, ok := provider.Lookup(ctx, "claude sonnet 4.6 (thinking)"); !ok || id != "claude-sonnet-4-6" {
+		t.Errorf("Lookup(case-insensitive) = (%q, %v), want (claude-sonnet-4-6, true)", id, ok)
+	}
+
+	// Unknown model
+	if id, ok := provider.Lookup(ctx, "bogus-model"); ok || id != "" {
+		t.Errorf("Lookup(bogus-model) = (%q, %v), want (\"\", false)", id, ok)
+	}
+
+	// Empty string
+	if id, ok := provider.Lookup(ctx, ""); ok || id != "" {
+		t.Errorf("Lookup(\"\") = (%q, %v), want (\"\", false)", id, ok)
+	}
+
+	// Provider with no known models
+	emptyProvider, _ := newTestProvider(t, (&fetchStub{err: errors.New("unavailable")}).fetch)
+	if id, ok := emptyProvider.Lookup(ctx, "claude-sonnet-4-6"); ok || id != "" {
+		t.Errorf("Lookup on empty provider = (%q, %v), want (\"\", false)", id, ok)
+	}
+}
