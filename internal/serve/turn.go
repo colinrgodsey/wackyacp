@@ -3,6 +3,7 @@ package serve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/colinrgodsey/wackyacp/internal/acp"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // forceCancelGrace is the backstop window after a session/cancel arrives but
@@ -210,6 +213,13 @@ func (b *Backend) Prompt(ctx context.Context, ts *turnState, promptText string, 
 				if m.err == io.EOF {
 					return finishStop(canceled), usage, nil
 				}
+				// A stream that ends with a canceled-context error while a cancel
+				// is in flight is the wackypub side honoring the cancel: the SDK
+				// ends the stream with the canceled context, not a clean EOF (the
+				// handler is transport-independent, so stdio and tcp behave alike).
+				if isCancelErr(m.err) && cancelInFlight(canceled, cancelCh) {
+					return "cancelled", usage, nil
+				}
 				return "", usage, m.err
 			}
 			u, merr := mapStreamEvent(m.resp, emit, b.logf)
@@ -289,6 +299,35 @@ func finishStop(canceled bool) string {
 		return "cancelled"
 	}
 	return "end_turn"
+}
+
+// isCancelErr reports whether a stream-end error is the gRPC/context
+// cancellation signal the wackypub SDK emits when a turn is canceled (the
+// handler returns the canceled context, which gRPC surfaces as
+// code = Canceled on both stdio and tcp transports).
+func isCancelErr(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if s, ok := status.FromError(err); ok {
+		return s.Code() == codes.Canceled
+	}
+	return false
+}
+
+// cancelInFlight reports whether a cancel has fired (canceled) or is pending
+// on cancelCh. The non-blocking probe never consumes the channel, so the
+// select case that nils it out still owns the first fire.
+func cancelInFlight(canceled bool, cancelCh <-chan struct{}) bool {
+	if canceled {
+		return true
+	}
+	select {
+	case <-cancelCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // rawInputFromSummary parses the redacted args summary into a JSON value for

@@ -61,6 +61,7 @@ type Server struct {
 	outMu     sync.Mutex
 	backend   *Backend
 	sessionID string
+	remote    bool
 }
 
 // NewServer wires an ACP server over one connection pair. agentFolder is
@@ -71,6 +72,22 @@ func NewServer(in io.Reader, out io.Writer, backend *Backend, agentFolder string
 		out:       out,
 		backend:   backend,
 		sessionID: SessionID(agentFolder),
+	}
+}
+
+// NewServerRemote wires an ACP server over one connection pair for remote
+// backend mode (wackyacp serve --remote). The session id comes from
+// SessionIDForAgent - there is no local agent folder in this mode - and cwd
+// validation is relaxed: the cwd param is a path on the ACP client's machine,
+// which need not be this one (the workspace lives on the remote endpoint), so
+// only absoluteness is checked.
+func NewServerRemote(in io.Reader, out io.Writer, backend *Backend, sessionID string) *Server {
+	return &Server{
+		in:        in,
+		out:       out,
+		backend:   backend,
+		sessionID: sessionID,
+		remote:    true,
 	}
 }
 
@@ -244,7 +261,7 @@ func (s *Server) handleSessionNew(ctx context.Context, id json.RawMessage, line 
 		s.sendError(id, acp.CodeInvalidParams, err.Error())
 		return
 	}
-	if envelope.Params.Cwd != "" && envelope.Params.Cwd != s.backend.AgentFolder() {
+	if envelope.Params.Cwd != "" && !s.remote && envelope.Params.Cwd != s.backend.AgentFolder() {
 		s.backend.logf("wackyacp serve: session/new cwd %s differs from agent folder %s; the agent operates in its own folder",
 			envelope.Params.Cwd, s.backend.AgentFolder())
 	}
@@ -266,6 +283,11 @@ func (s *Server) validateCwd(cwd string) error {
 	}
 	if !filepath.IsAbs(cwd) {
 		return fmt.Errorf("cwd must be an absolute path, but received: %s", cwd)
+	}
+	if s.remote {
+		// The workspace is on the remote endpoint, not here; the cwd is the
+		// editor's local project dir. Existence is not this machine's to check.
+		return nil
 	}
 	st, err := os.Stat(cwd)
 	if err != nil {
