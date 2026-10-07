@@ -37,9 +37,6 @@ func NewStore(stateDir string) *Store {
 	}
 }
 
-// Path reports the file this Store reads and writes.
-func (s *Store) Path() string { return s.path }
-
 // Read returns the persisted sessions. A missing file yields an empty map; a
 // file that cannot be parsed yields an error so the caller can warn, since
 // silently discarding bindings would strand live conversations.

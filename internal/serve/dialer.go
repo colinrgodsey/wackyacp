@@ -106,28 +106,13 @@ func (d *Dialer) Dial(ctx context.Context, target string) (net.Conn, error) {
 	return conn, nil
 }
 
-// ActiveCmd returns the current spawn attempt (live or reaped). Exposed for
-// diagnostics and tests (e.g. killing the child to verify the re-dial heals).
-func (d *Dialer) ActiveCmd() *exec.Cmd {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.activeCmd
-}
-
-// lastDialError reports the last spawn failure, or nil if the last dial succeeded.
-func (d *Dialer) LastDialError() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.lastErr
-}
-
-// ChildAlive reports whether the active child still exists in the process
+// childAlive reports whether the active child still exists in the process
 // table, via kill(pid, 0): ESRCH means the kernel has reaped it. A missing
 // active cmd (no completed dial) counts as alive: callers should only act on
 // a confirmed dead child. cmd.ProcessState is deliberately NOT read here: it
 // is written by cmd.Wait in the reap goroutine, and reading it from this one
 // would race.
-func (d *Dialer) ChildAlive() bool {
+func (d *Dialer) childAlive() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cmd := d.activeCmd

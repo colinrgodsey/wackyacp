@@ -25,31 +25,6 @@ var Version = "0.1.0"
 // forward-compatible fields.
 type Update = map[string]any
 
-// JSON-RPC 2.0 wire types (mirroring internal/acp, which keeps its own
-// copies for the client face; the wire format is identical).
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
-type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *RPCError       `json:"error,omitempty"`
-}
-
-// RPCError is a JSON-RPC 2.0 error object.
-type RPCError struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-func (e *RPCError) Error() string { return fmt.Sprintf("[%d] %s", e.Code, e.Message) }
-
 // Server is one ACP connection: a newline-delimited JSON-RPC 2.0 session over
 // (in, out). It holds no conversation state - the ACP session IS the
 // wackypub agent session and all history lives in the agent folder.
@@ -196,7 +171,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(line, &raw); err != nil {
-			s.sendError(nil, acp.CodeParseError, "parse error")
+			s.sendError(json.RawMessage("null"), acp.CodeParseError, "parse error")
 			continue
 		}
 		id, hasID := raw["id"]
@@ -437,18 +412,16 @@ func (s *Server) sendNotification(method string, params any) error {
 	return err
 }
 
-func (s *Server) sendResponse(id json.RawMessage, result any, rpcErr *RPCError) error {
-	resp := map[string]any{"jsonrpc": "2.0", "id": id}
-	if rpcErr != nil {
-		resp["error"] = rpcErr
-	} else {
+func (s *Server) sendResponse(id json.RawMessage, result any, rpcErr *acp.RPCError) error {
+	resp := acp.RPCResponse{JSONRPC: "2.0", ID: id, Error: rpcErr}
+	if rpcErr == nil {
 		raw, err := json.Marshal(result)
 		if err != nil {
 			return err
 		}
 		// RawMessage keeps the pre-marshaled bytes intact; a bare []byte
 		// would be re-encoded as base64.
-		resp["result"] = json.RawMessage(raw)
+		resp.Result = json.RawMessage(raw)
 	}
 	data, err := json.Marshal(resp)
 	if err != nil {
@@ -461,7 +434,7 @@ func (s *Server) sendResponse(id json.RawMessage, result any, rpcErr *RPCError) 
 }
 
 func (s *Server) sendError(id json.RawMessage, code int, msg string) error {
-	return s.sendResponse(id, nil, &RPCError{Code: code, Message: msg})
+	return s.sendResponse(id, nil, &acp.RPCError{Code: code, Message: msg})
 }
 
 // flattenPrompt reduces an ACP prompt's ContentBlock array to the wackypub

@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,9 +33,87 @@ type ModelInfo struct {
 	RawOptions   any
 }
 
-// ExtractModelInfo parses the raw configOptions JSON payload from an ACP harness.
-// It locates the model option (by id, key, or category == "model") and extracts
-// the current model and available options list.
+// ConfigOption is one entry of a harness configOptions array. The ACP spec
+// models the model selector with id/currentValue; the claude-acp and wackyagy
+// dialects use the key/category/selected/value aliases instead. Every field
+// name real harnesses send on the wire stays decodable - dropping one is a
+// bridge break, not a cleanup.
+type ConfigOption struct {
+	ID           string         `json:"id,omitempty"`
+	Key          string         `json:"key,omitempty"`
+	Category     string         `json:"category,omitempty"`
+	CurrentValue string         `json:"currentValue,omitempty"`
+	Selected     string         `json:"selected,omitempty"`
+	Value        string         `json:"value,omitempty"`
+	Options      []ConfigChoice `json:"options,omitempty"`
+}
+
+// ConfigChoice is one selectable option under a ConfigOption. Harnesses send
+// either value or id for the option's identity (value first).
+type ConfigChoice struct {
+	Value string `json:"value,omitempty"`
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Label string `json:"label,omitempty"`
+}
+
+func (c ConfigOption) isModelOption() bool {
+	return c.ID == "model" || c.Key == "model" || c.Category == "model"
+}
+
+// currentModel resolves the current model across the spec (currentValue) and
+// dialect (selected, value) field names.
+func (c ConfigOption) currentModel() string {
+	switch {
+	case c.CurrentValue != "":
+		return c.CurrentValue
+	case c.Selected != "":
+		return c.Selected
+	}
+	return c.Value
+}
+
+func (c ConfigOption) choices() []ModelChoice {
+	var out []ModelChoice
+	for _, ch := range c.Options {
+		id := ch.Value
+		if id == "" {
+			id = ch.ID
+		}
+		if id == "" {
+			continue
+		}
+		out = append(out, ModelChoice{ID: id, Name: ch.Name, Label: ch.Label})
+	}
+	return out
+}
+
+// decodeConfigOptions extracts the configOptions array from a harness payload.
+// Harnesses wrap it two ways: a bare [...] array or a {"configOptions": [...]}
+// object. It returns the array's raw bytes (for verbatim passthrough) and
+// whether one of the two shapes was found.
+func decodeConfigOptions(raw json.RawMessage) (json.RawMessage, bool) {
+	var list json.RawMessage
+	if err := json.Unmarshal(raw, &list); err == nil && isJSONArray(list) {
+		return list, true
+	}
+	var wrapped struct {
+		ConfigOptions json.RawMessage `json:"configOptions"`
+	}
+	if err := json.Unmarshal(raw, &wrapped); err == nil && isJSONArray(wrapped.ConfigOptions) {
+		return wrapped.ConfigOptions, true
+	}
+	return nil, false
+}
+
+func isJSONArray(b json.RawMessage) bool {
+	t := bytes.TrimLeft(b, " \t\r\n")
+	return len(t) > 0 && t[0] == '['
+}
+
+// ExtractModelInfo parses the raw configOptions payload from an ACP harness.
+// It locates the model option (by id, key, or category == "model") and
+// extracts the current model and available options list.
 func ExtractModelInfo(raw json.RawMessage, fallback string) ModelInfo {
 	info := ModelInfo{
 		CurrentModel: fallback,
@@ -44,79 +123,47 @@ func ExtractModelInfo(raw json.RawMessage, fallback string) ModelInfo {
 		return info
 	}
 
-	var parsed any
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	listRaw, found := decodeConfigOptions(raw)
+	if !found {
+		// Unknown container shape: surface the payload verbatim so callers
+		// can still show it.
+		var parsed any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			info.RawOptions = raw
+		} else {
+			info.RawOptions = parsed
+		}
+		return info
+	}
+
+	var options []ConfigOption
+	if err := json.Unmarshal(listRaw, &options); err != nil {
 		info.RawOptions = raw
 		return info
 	}
 
-	var optionsList []any
-	if obj, ok := parsed.(map[string]any); ok {
-		if co, exists := obj["configOptions"]; exists {
-			if list, ok := co.([]any); ok {
-				optionsList = list
-			}
-		}
-	} else if list, ok := parsed.([]any); ok {
-		optionsList = list
-	}
-
-	for _, item := range optionsList {
-		m, ok := item.(map[string]any)
-		if !ok {
+	for _, opt := range options {
+		if !opt.isModelOption() {
 			continue
 		}
-		id, _ := m["id"].(string)
-		key, _ := m["key"].(string)
-		cat, _ := m["category"].(string)
-		if id != "model" && key != "model" && cat != "model" {
-			continue
+		if m := opt.currentModel(); m != "" {
+			info.CurrentModel = m
 		}
-
-		if cv, ok := m["currentValue"].(string); ok && cv != "" {
-			info.CurrentModel = cv
-		} else if sel, ok := m["selected"].(string); ok && sel != "" {
-			info.CurrentModel = sel
-		} else if val, ok := m["value"].(string); ok && val != "" {
-			info.CurrentModel = val
-		}
-
-		if rawOpts, ok := m["options"].([]any); ok {
-			for _, opt := range rawOpts {
-				if optMap, ok := opt.(map[string]any); ok {
-					choice := ModelChoice{}
-					if v, ok := optMap["value"].(string); ok {
-						choice.ID = v
-					} else if idVal, ok := optMap["id"].(string); ok {
-						choice.ID = idVal
-					}
-					if n, ok := optMap["name"].(string); ok {
-						choice.Name = n
-					}
-					if l, ok := optMap["label"].(string); ok {
-						choice.Label = l
-					}
-					if choice.ID != "" {
-						info.Options = append(info.Options, choice)
-					}
-				}
-			}
-		}
-
-		if info.CurrentModel == "" && len(info.Options) > 0 {
-			info.CurrentModel = info.Options[0].ID
-		}
+		info.Options = opt.choices()
 		break
 	}
 
+	if info.CurrentModel == "" && len(info.Options) > 0 {
+		info.CurrentModel = info.Options[0].ID
+	}
 	if info.CurrentModel == "" {
 		info.CurrentModel = fallback
 	}
 
-	if len(optionsList) > 0 {
-		info.RawOptions = optionsList
+	if isJSONArray(listRaw) && len(bytes.TrimLeft(listRaw, " \t\r\n")) > 2 {
+		info.RawOptions = json.RawMessage(listRaw)
 	} else {
-		info.RawOptions = parsed
+		info.RawOptions = json.RawMessage(raw)
 	}
 
 	return info

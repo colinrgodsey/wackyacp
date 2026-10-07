@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,7 +91,7 @@ type Client struct {
 	stdout    io.ReadCloser
 	writeMu   sync.Mutex
 	pendingMu sync.Mutex
-	pending   map[int64]chan *rpcResponse
+	pending   map[int64]chan *RPCResponse
 	reqID     atomic.Int64
 
 	Capabilities AgentCapabilities
@@ -135,7 +134,7 @@ func NewClient(stdin io.WriteCloser, stdout io.ReadCloser) *Client {
 	c := &Client{
 		stdin:   stdin,
 		stdout:  stdout,
-		pending: make(map[int64]chan *rpcResponse),
+		pending: make(map[int64]chan *RPCResponse),
 		doneCh:  make(chan struct{}),
 	}
 	go c.readLoop()
@@ -198,25 +197,20 @@ func (c *Client) readLoop() {
 	for _, ch := range c.pending {
 		close(ch)
 	}
-	c.pending = make(map[int64]chan *rpcResponse)
+	c.pending = make(map[int64]chan *RPCResponse)
 	c.pendingMu.Unlock()
 
 	close(c.doneCh)
 }
 
 func (c *Client) handleResponse(line []byte) {
-	var resp rpcResponse
+	var resp RPCResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		return
 	}
 
 	var id int64
-	switch v := resp.ID.(type) {
-	case float64:
-		id = int64(v)
-	case int64:
-		id = v
-	default:
+	if err := json.Unmarshal(resp.ID, &id); err != nil {
 		return
 	}
 
@@ -252,7 +246,7 @@ func (c *Client) flushActiveTurn() {
 }
 
 func (c *Client) handleIncomingRequest(line []byte) {
-	var req rpcRequest
+	var req RPCRequest
 	if err := json.Unmarshal(line, &req); err != nil {
 		return
 	}
@@ -261,13 +255,8 @@ func (c *Client) handleIncomingRequest(line []byte) {
 	case MethodSessionRequestPermission:
 		c.flushActiveTurn()
 
-		raw, err := json.Marshal(req.Params)
-		if err != nil {
-			c.respondPermissionError(req.ID, CodeInvalidParams, fmt.Sprintf("marshaling request params: %v", err))
-			break
-		}
 		var params PermissionRequestParams
-		if err := json.Unmarshal(raw, &params); err != nil {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
 			c.respondPermissionError(req.ID, CodeInvalidParams, fmt.Sprintf("invalid %s params: %v", MethodSessionRequestPermission, err))
 			break
 		}
@@ -398,7 +387,7 @@ func (c *Client) handleIncomingRequest(line []byte) {
 	}
 }
 
-func (c *Client) respondPermissionError(reqID any, code int, msg string) {
+func (c *Client) respondPermissionError(reqID json.RawMessage, code int, msg string) {
 	if err := c.sendResponse(reqID, nil, &RPCError{
 		Code:    code,
 		Message: msg,
@@ -504,7 +493,7 @@ func isAllowTokenMatch(s string) bool {
 }
 
 func (c *Client) handleIncomingNotification(line []byte) {
-	var notif rpcRequest
+	var notif RPCRequest
 	if err := json.Unmarshal(line, &notif); err != nil {
 		return
 	}
@@ -523,8 +512,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 		SessionID string          `json:"sessionId"`
 		Update    json.RawMessage `json:"update"`
 	}
-	raw, _ := json.Marshal(notif.Params)
-	if err := json.Unmarshal(raw, &params); err != nil {
+	if err := json.Unmarshal(notif.Params, &params); err != nil {
 		return
 	}
 
@@ -593,20 +581,26 @@ func (c *Client) handleIncomingNotification(line []byte) {
 	}
 }
 
-func (c *Client) sendRequest(ctx context.Context, method string, params any) (*rpcResponse, error) {
+func (c *Client) sendRequest(ctx context.Context, method string, params any) (*RPCResponse, error) {
 	id := c.reqID.Add(1)
-	respCh := make(chan *rpcResponse, 1)
+	idJSON, err := json.Marshal(id)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request id: %w", err)
+	}
+	req := RPCRequest{JSONRPC: "2.0", ID: idJSON, Method: method}
+	if params != nil {
+		paramsJSON, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling request params: %w", err)
+		}
+		req.Params = paramsJSON
+	}
+	respCh := make(chan *RPCResponse, 1)
 
 	c.pendingMu.Lock()
 	c.pending[id] = respCh
 	c.pendingMu.Unlock()
 
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  method,
-		Params:  params,
-	}
 	data, err := json.Marshal(req)
 	if err != nil {
 		c.pendingMu.Lock()
@@ -653,12 +647,15 @@ func (c *Client) sendRequest(ctx context.Context, method string, params any) (*r
 }
 
 func (c *Client) sendNotification(method string, params any) error {
-	notif := rpcRequest{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
+	req := RPCRequest{JSONRPC: "2.0", Method: method}
+	if params != nil {
+		paramsJSON, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("marshaling notification params: %w", err)
+		}
+		req.Params = paramsJSON
 	}
-	data, err := json.Marshal(notif)
+	data, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshaling notification: %w", err)
 	}
@@ -669,8 +666,8 @@ func (c *Client) sendNotification(method string, params any) error {
 	return err
 }
 
-func (c *Client) sendResponse(id any, result any, rpcErr *RPCError) error {
-	resp := rpcResponse{
+func (c *Client) sendResponse(id json.RawMessage, result any, rpcErr *RPCError) error {
+	resp := RPCResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error:   rpcErr,
@@ -817,28 +814,29 @@ func (c *Client) NewSession(ctx context.Context, agentFolder string) (string, er
 
 // EstablishSession executes the capability-driven fallback chain:
 // session/resume -> session/load -> session/new.
-func (c *Client) EstablishSession(ctx context.Context, agentFolder string, saved *session.SessionData) (string, error) {
+func (c *Client) EstablishSession(ctx context.Context, agentFolder string, saved *session.SessionData) (string, []error, error) {
+	var warnings []error
 	if saved != nil && saved.SessionID != "" {
 		// Verify ownership assertion on the saved record
 		if saved.AgentFolder != "" && saved.AgentFolder != agentFolder {
-			return "", fmt.Errorf("%w: saved session recorded %q != %q", ErrSessionMismatch, saved.AgentFolder, agentFolder)
+			return "", nil, fmt.Errorf("%w: saved session recorded %q != %q", ErrSessionMismatch, saved.AgentFolder, agentFolder)
 		}
 
 		// 1. Try session/resume if capability advertised
 		if c.Capabilities.SessionCapabilities.Resume != nil {
 			if err := c.ResumeSession(ctx, saved.SessionID, agentFolder); err == nil {
-				return saved.SessionID, nil
+				return saved.SessionID, nil, nil
 			} else if errors.Is(err, ErrSessionMismatch) {
-				fmt.Fprintf(os.Stderr, "wackyacp: warning: session ownership mismatch on resume: %v\n", err)
+				warnings = append(warnings, fmt.Errorf("warning: session ownership mismatch on resume: %w", err))
 			}
 		}
 
 		// 2. Try session/load if capability advertised
 		if c.Capabilities.LoadSession {
 			if err := c.LoadSession(ctx, saved.SessionID, agentFolder); err == nil {
-				return saved.SessionID, nil
+				return saved.SessionID, warnings, nil
 			} else if errors.Is(err, ErrSessionMismatch) {
-				fmt.Fprintf(os.Stderr, "wackyacp: warning: session ownership mismatch on load: %v\n", err)
+				warnings = append(warnings, fmt.Errorf("warning: session ownership mismatch on load: %w", err))
 			}
 		}
 	}
@@ -846,15 +844,15 @@ func (c *Client) EstablishSession(ctx context.Context, agentFolder string, saved
 	// 3. Fall back to fresh session/new
 	sessionID, err := c.NewSession(ctx, agentFolder)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Persist new session file
 	if _, err := session.WriteSession(agentFolder, sessionID); err != nil {
-		return "", fmt.Errorf("saving session file: %w", err)
+		return "", nil, fmt.Errorf("saving session file: %w", err)
 	}
 
-	return sessionID, nil
+	return sessionID, warnings, nil
 }
 
 // Prompt executes a prompt turn against the specified session.
@@ -937,7 +935,7 @@ func (c *Client) Cancel(sessionID string) error {
 	})
 }
 
-// SetConfigOption sends session/setConfigOption to the harness (configId "model" is the
+// SetConfigOption sends session/set_config_option to the harness (configId "model" is the
 // only supported option today). It returns the harness's configOptions array verbatim. The
 // harness confirms the session-scoped model change in its response, or returns an RPC error
 // for an unknown model or config id - a *ConfigOptionError is returned so callers can map

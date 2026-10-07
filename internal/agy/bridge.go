@@ -127,13 +127,6 @@ func NewBridge(cfg Config) *Bridge {
 	return newBridge(cfg, nil)
 }
 
-// NewBridgeWithStarter returns a Bridge whose agent process launcher is
-// substituted, for exercising the turn loop without an agent. The real starter is
-// covered by the process-stub integration tests.
-func NewBridgeWithStarter(cfg Config, starter agentStarter) *Bridge {
-	return newBridge(cfg, starter)
-}
-
 func newBridge(cfg Config, starter agentStarter) *Bridge {
 	cfg = cfg.withDefaults()
 
