@@ -122,12 +122,58 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}()
 
-	scanner := bufio.NewScanner(s.in)
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024) // 10MB max line, matching the client face
+	// A blocked read on a real fd cannot be interrupted: close() from another thread
+	// does not wake read(2) on Linux, so Serve must not make its own return depend on
+	// the read waking (bugs/wackyacp/serve-stdin-eof-shutdown-hang). Scan on a
+	// goroutine and select here instead. At shutdown that goroutine stays blocked and
+	// the process exit reclaims it, which is harmless because nothing waits on it, and
+	// it avoids closing a caller-owned stdin, which would hand anything else reading
+	// fd 0 a spurious EOF.
+	type scannedLine struct {
+		line []byte
+		err  error
+	}
+	scanned := make(chan scannedLine, 8)
+	quit := make(chan struct{})
+	defer close(quit)
+	go func() {
+		defer close(scanned)
+		scanner := bufio.NewScanner(s.in)
+		buf := make([]byte, 64*1024)
+		scanner.Buffer(buf, 10*1024*1024) // 10MB max line, matching the client face
+		for scanner.Scan() {
+			select {
+			case scanned <- scannedLine{line: append([]byte(nil), scanner.Bytes()...)}:
+			case <-quit:
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+			select {
+			case scanned <- scannedLine{err: err}:
+			case <-quit:
+			}
+		}
+	}()
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	for {
+		var line []byte
+		select {
+		case <-ctx.Done():
+			return nil
+		case got, ok := <-scanned:
+			if !ok {
+				return nil // clean EOF
+			}
+			if got.err != nil {
+				if ctx.Err() != nil {
+					// A read error provoked by shutdown is not a transport fault.
+					return nil
+				}
+				return got.err
+			}
+			line = got.line
+		}
 		if len(line) == 0 {
 			continue
 		}
@@ -157,10 +203,6 @@ func (s *Server) Serve(ctx context.Context) error {
 			go s.handleNotification(ctx, methodStr, lineCopy)
 		}
 	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	return nil
 }
 
 func (s *Server) handleRequest(ctx context.Context, method string, id json.RawMessage, line []byte) {
