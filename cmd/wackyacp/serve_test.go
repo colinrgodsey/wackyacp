@@ -266,6 +266,35 @@ func TestParseServeArgs_DanglingFlagValue(t *testing.T) {
 	}
 }
 
+func TestParseServeArgs_RemoteMode(t *testing.T) {
+	// Remote mode identity: explicit --agent-id (routing-proxy native), no
+	// folder, optional --token for the remote bearer secret.
+	opts, err := parseServeArgs([]string{"--remote", "127.0.0.1:8423", "--agent-id", "agent1"})
+	if err != nil {
+		t.Fatalf("remote + --agent-id: %v", err)
+	}
+	if opts.remote != "127.0.0.1:8423" || opts.agentID != "agent1" || opts.agentFolder != "" {
+		t.Fatalf("bad remote opts: %+v", opts)
+	}
+	opts, err = parseServeArgs([]string{"--remote=127.0.0.1:8423", "--agent-id=agent1", "--token", "s3cret"})
+	if err != nil || opts.token != "s3cret" {
+		t.Fatalf("remote + --token: %v %+v", err, opts)
+	}
+
+	for name, args := range map[string][]string{
+		"remote without agent-id":  {"--remote", "h:1"},
+		"remote with agent-folder": {"--remote", "h:1", "--agent-id", "a", "--agent-folder", "/x"},
+		"agent-id in local mode":   {"--agent-folder", "/x", "--agent-id", "a"},
+	} {
+		if _, err := parseServeArgs(args); err == nil {
+			t.Errorf("%s (%v): expected error, got nil", name, args)
+		}
+	}
+	if _, err := parseServeArgs([]string{"--remote", "h:1", "--agent-id", "a", "--token"}); err == nil || !strings.Contains(err.Error(), "flag requires an argument") {
+		t.Errorf("dangling --token: got %v", err)
+	}
+}
+
 // stubWackypub is a serve.Wackypub that never produces a turn: the
 // connection-close test needs no turns at all.
 type stubWackypub struct{}
@@ -287,7 +316,8 @@ func (stubWackypub) CancelTurn(context.Context, *agentv1.CancelTurnRequest) (*ag
 // observable as a read that returns a close error right after cancel; before
 // the fix the socket stayed open and the read would time out.
 func TestRunServeTCPClosesIdleConnsOnShutdown(t *testing.T) {
-	b := serve.NewBackend("agent1", "/tmp", t.TempDir(), &stubWackypub{}, nil)
+	folder := t.TempDir()
+	b := serve.NewBackend("agent1", "/tmp", folder, &stubWackypub{}, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -301,7 +331,9 @@ func TestRunServeTCPClosesIdleConnsOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runServeTCP(ctx, b, &serveOptions{host: "127.0.0.1", port: port}) }()
+	go func() {
+		done <- runServeTCP(ctx, b, &serveOptions{host: "127.0.0.1", port: port}, serve.SessionID(folder), false)
+	}()
 
 	conn, err := dialUntil(t, "127.0.0.1", port, 5*time.Second)
 	if err != nil {

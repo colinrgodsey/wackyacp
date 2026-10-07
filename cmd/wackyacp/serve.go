@@ -24,6 +24,9 @@ type serveOptions struct {
 	wackyPubBin string
 	host        string
 	port        int
+	remote      string // --remote host:port (remote wackypub tcp-serve endpoint)
+	agentID     string // --agent-id (remote mode identity; routing-proxy native)
+	token       string // --token (remote bearer secret; env fallback WACKYPUB_SERVE_TOKEN)
 }
 
 func parseServeArgs(args []string) (*serveOptions, error) {
@@ -73,6 +76,30 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 			}
 			opts.port = p
 			i++
+		case strings.HasPrefix(arg, "--remote="):
+			opts.remote = strings.TrimPrefix(arg, "--remote=")
+		case arg == "--remote":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
+			}
+			opts.remote = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--agent-id="):
+			opts.agentID = strings.TrimPrefix(arg, "--agent-id=")
+		case arg == "--agent-id":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
+			}
+			opts.agentID = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--token="):
+			opts.token = strings.TrimPrefix(arg, "--token=")
+		case arg == "--token":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag requires an argument: %s", arg)
+			}
+			opts.token = args[i+1]
+			i++
 		case strings.HasPrefix(arg, "-"):
 			return nil, fmt.Errorf("unknown flag: %s", arg)
 		default:
@@ -92,8 +119,23 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 		return nil, fmt.Errorf("unexpected argument: %s", cleanPos[0])
 	}
 
-	if opts.agentFolder == "" {
-		return nil, fmt.Errorf("--agent-folder is required")
+	if opts.remote != "" {
+		// Remote mode: identity is the explicit agent id (routing-proxy
+		// native) - see the identity decision in the serve-remote-dial card.
+		// No local folder is read, so the D117 abs-path check does not apply.
+		if opts.agentID == "" {
+			return nil, fmt.Errorf("--remote requires --agent-id (the agent the remote tcp-serve hosts)")
+		}
+		if opts.agentFolder != "" {
+			return nil, fmt.Errorf("--remote and --agent-folder are mutually exclusive: remote mode identifies the agent by id; the folder stays on the remote host")
+		}
+	} else {
+		if opts.agentID != "" {
+			return nil, fmt.Errorf("--agent-id is only valid with --remote; local mode derives identity from --agent-folder")
+		}
+		if opts.agentFolder == "" {
+			return nil, fmt.Errorf("--agent-folder is required")
+		}
 	}
 	if opts.port < 0 {
 		return nil, fmt.Errorf("--port must be non-negative")
@@ -108,6 +150,17 @@ func runServe(args []string) error {
 	opts, err := parseServeArgs(args)
 	if err != nil {
 		return err
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if opts.remote != "" {
+		token := opts.token
+		if token == "" {
+			token = os.Getenv(serve.ServeTokenEnv)
+		}
+		return runServeRemote(ctx, opts, token)
 	}
 
 	// Validation posture matches the D117 bridge: absolute path only, no CWD
@@ -128,9 +181,6 @@ func runServe(args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving wackypub binary %q: %w", opts.wackyPubBin, err)
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	dialer := serve.NewDialer(ctx, bin, workspaceDir)
 	defer func() { _ = dialer.Close() }()
@@ -158,7 +208,7 @@ func runServe(args []string) error {
 
 	backend := serve.NewBackend(agentID, workspaceDir, opts.agentFolder, serve.NewGRPCWackypub(agentv1.NewAgentServiceClient(gc)), nil)
 	if opts.port != 0 {
-		return runServeTCP(ctx, backend, opts)
+		return runServeTCP(ctx, backend, opts, serve.SessionID(opts.agentFolder), false)
 	}
 
 	fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s workspace=%s session=%s transport=stdio\n",
@@ -175,7 +225,32 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions) error {
+// runServeRemote is the --remote branch: no child spawn, no local workspace
+// requirement. The agent is identified by id (routing-proxy native); the
+// WorkspaceDir request field is left empty so the remote server resolves its
+// own workspace (the wackypub SDK prefers the request workspace only when it
+// is non-empty, else it falls back to the server's).
+func runServeRemote(ctx context.Context, opts *serveOptions, token string) error {
+	gc, err := serve.NewRemoteClient(ctx, opts.remote, token)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gc.Close() }()
+
+	backend := serve.NewBackend(opts.agentID, "", "", serve.NewGRPCWackypub(agentv1.NewAgentServiceClient(gc)), nil)
+	sessionID := serve.SessionIDForAgent(opts.agentID)
+
+	if opts.port != 0 {
+		return runServeTCP(ctx, backend, opts, sessionID, true)
+	}
+
+	fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s remote=%s session=%s transport=stdio\n",
+		opts.agentID, opts.remote, sessionID)
+	srv := serve.NewServerRemote(os.Stdin, os.Stdout, backend, sessionID)
+	return srv.Serve(ctx)
+}
+
+func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions, sessionID string, remote bool) error {
 	host := opts.host
 	if host == "" {
 		host = "127.0.0.1"
@@ -230,8 +305,13 @@ func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions
 		connMu.Unlock()
 	}()
 
-	fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s workspace=%s session=%s transport=tcp %s\n",
-		backend.AgentID(), filepath.Dir(backend.AgentFolder()), serve.SessionID(backend.AgentFolder()), ln.Addr().String())
+	if remote {
+		fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s remote=%s session=%s transport=tcp %s\n",
+			backend.AgentID(), opts.remote, sessionID, ln.Addr().String())
+	} else {
+		fmt.Fprintf(os.Stderr, "wackyacp serve: agent=%s workspace=%s session=%s transport=tcp %s\n",
+			backend.AgentID(), filepath.Dir(backend.AgentFolder()), serve.SessionID(backend.AgentFolder()), ln.Addr().String())
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -246,7 +326,12 @@ func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions
 		conns = append(conns, conn)
 		connMu.Unlock()
 		go func() {
-			srv := serve.NewServer(conn, conn, backend, backend.AgentFolder())
+			var srv *serve.Server
+			if remote {
+				srv = serve.NewServerRemote(conn, conn, backend, sessionID)
+			} else {
+				srv = serve.NewServer(conn, conn, backend, backend.AgentFolder())
+			}
 			if err := srv.Serve(ctx); err != nil && ctx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "wackyacp serve: connection: %v\n", err)
 			}

@@ -37,3 +37,22 @@ func TestSessionIDStableAndDistinct(t *testing.T) {
 		t.Fatal("redundant elements must not change the id")
 	}
 }
+
+func TestSessionIDForAgent(t *testing.T) {
+	id := SessionIDForAgent("agent1")
+	if !strings.HasPrefix(id, "wackyacp:") {
+		t.Fatalf("missing prefix: %s", id)
+	}
+	if id != SessionIDForAgent("agent1") {
+		t.Fatal("same agent id must give the same session id")
+	}
+	if id == SessionIDForAgent("agent2") {
+		t.Fatal("different agent ids must give different session ids")
+	}
+	// The two derivations must stay disjoint: an agent-id-derived id must
+	// never equal a folder-derived id, so a local serve and a remote serve
+	// of the same agent never look like each other's sessions.
+	if id == SessionID("agent1") || id == SessionID("agent:agent1") {
+		t.Fatal("agent-id derivation collides with folder derivation")
+	}
+}
