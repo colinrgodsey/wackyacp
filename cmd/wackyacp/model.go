@@ -21,7 +21,7 @@ var errExit = errors.New("command failed")
 type modelOptions struct {
 	verb           string
 	modelArg       string
-	workspace      string
+	agentFolder    string
 	harnessCmd     string
 	harnessArgs    string
 	permissionMode string
@@ -34,18 +34,20 @@ func parseModelArgs(args []string) (*modelOptions, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
-		case strings.HasPrefix(arg, "--workspace="):
-			opts.workspace = strings.TrimPrefix(arg, "--workspace=")
-		case arg == "--workspace" || arg == "-w":
-			if i+1 < len(args) {
-				opts.workspace = args[i+1]
-				i++
-			}
+		// Agent folder: --agent-folder is the canonical name (matches serve
+		// mode); --workspace and -w are deprecated aliases kept for scripts.
 		case strings.HasPrefix(arg, "--agent-folder="):
-			opts.workspace = strings.TrimPrefix(arg, "--agent-folder=")
+			opts.agentFolder = strings.TrimPrefix(arg, "--agent-folder=")
 		case arg == "--agent-folder":
 			if i+1 < len(args) {
-				opts.workspace = args[i+1]
+				opts.agentFolder = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--workspace="):
+			opts.agentFolder = strings.TrimPrefix(arg, "--workspace=")
+		case arg == "--workspace" || arg == "-w":
+			if i+1 < len(args) {
+				opts.agentFolder = args[i+1]
 				i++
 			}
 		case strings.HasPrefix(arg, "--harness-cmd="):
@@ -108,56 +110,61 @@ func extractModelInfo(raw json.RawMessage, fallback string) (string, any) {
 	return info.CurrentModel, info.RawOptions
 }
 
+// emitJSONError writes the human-facing line to stderr and the machine-facing
+// error to stdout (the model CLI contract: stdout carries JSON only), then
+// returns errExit so main exits non-zero.
+func emitJSONError(detail string, err error) error {
+	if detail == "" {
+		fmt.Fprintf(os.Stderr, "wackyacp: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "wackyacp: %s: %v\n", detail, err)
+	}
+	errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
+	fmt.Println(string(errJSON))
+	return errExit
+}
+
+// emitJSONErrorWithCode is the emitJSONError variant for harness config-option
+// rejections, which carry a JSON-RPC error code.
+func emitJSONErrorWithCode(detail string, code int, msg string) error {
+	fmt.Fprintf(os.Stderr, "wackyacp: %s: [%d] %s\n", detail, code, msg)
+	errJSON, _ := json.Marshal(map[string]any{"error": msg, "code": code})
+	fmt.Println(string(errJSON))
+	return errExit
+}
+
 func runModel(args []string) error {
 	opts, err := parseModelArgs(args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("", err)
 	}
 
 	if opts.verb == "set" && opts.modelArg == "" {
-		fmt.Fprintf(os.Stderr, "wackyacp: model cannot be empty\n")
-		errJSON, _ := json.Marshal(map[string]any{"error": "model cannot be empty"})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("", errors.New("model cannot be empty"))
 	}
 
-	agentFolder := opts.workspace
+	agentFolder := opts.agentFolder
 	if agentFolder == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "wackyacp: resolving working directory: %v\n", err)
-			errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-			fmt.Println(string(errJSON))
-			return errExit
+			return emitJSONError("resolving working directory", err)
 		}
 		agentFolder = cwd
 	}
 
 	absFolder, err := filepath.Abs(agentFolder)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: resolving agent folder path: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("resolving agent folder path", err)
 	}
 	agentFolder = absFolder
 
 	harnessCfg, err := resolveHarnessConfig(agentFolder, opts.harnessCmd, opts.harnessArgs, opts.permissionMode)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("", err)
 	}
 
 	if _, err := harness.Resolve(harnessCfg.Command); err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: resolving harness: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("resolving harness", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -165,10 +172,7 @@ func runModel(args []string) error {
 
 	lock, err := session.AcquireLock(ctx, agentFolder)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: acquiring session lock: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("acquiring session lock", err)
 	}
 	defer func() {
 		_ = lock.Release()
@@ -186,10 +190,7 @@ func runModel(args []string) error {
 		Stderr:      os.Stderr,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: starting harness: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("starting harness", err)
 	}
 	defer func() {
 		_ = proc.Close()
@@ -198,18 +199,15 @@ func runModel(args []string) error {
 	acpClient := acp.NewClient(proc.Stdin, proc.Stdout)
 	acpClient.PermissionMode = harnessCfg.PermissionMode
 	if _, err := acpClient.Initialize(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: acp initialize failed: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("acp initialize failed", err)
 	}
 
-	sessionID, err := acpClient.EstablishSession(ctx, agentFolder, savedSession)
+	sessionID, warnings, err := acpClient.EstablishSession(ctx, agentFolder, savedSession)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "wackyacp: establishing session: %v\n", err)
-		errJSON, _ := json.Marshal(map[string]any{"error": err.Error()})
-		fmt.Println(string(errJSON))
-		return errExit
+		return emitJSONError("establishing session", err)
+	}
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "wackyacp: %v\n", w)
 	}
 
 	if opts.verb == "set" {
@@ -217,20 +215,9 @@ func runModel(args []string) error {
 		if err != nil {
 			var cfgErr *acp.ConfigOptionError
 			if errors.As(err, &cfgErr) {
-				fmt.Fprintf(os.Stderr, "wackyacp: session/setConfigOption failed: [%d] %s\n", cfgErr.Code, cfgErr.Message)
-				errJSON, _ := json.Marshal(map[string]any{
-					"error": cfgErr.Message,
-					"code":  cfgErr.Code,
-				})
-				fmt.Println(string(errJSON))
-			} else {
-				fmt.Fprintf(os.Stderr, "wackyacp: session/setConfigOption failed: %v\n", err)
-				errJSON, _ := json.Marshal(map[string]any{
-					"error": err.Error(),
-				})
-				fmt.Println(string(errJSON))
+				return emitJSONErrorWithCode(acp.MethodSessionSetConfigOption+" failed", cfgErr.Code, cfgErr.Message)
 			}
-			return errExit
+			return emitJSONError(acp.MethodSessionSetConfigOption+" failed", err)
 		}
 
 		confirmedModel, configOptions := extractModelInfo(rawResult, opts.modelArg)

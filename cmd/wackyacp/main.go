@@ -91,9 +91,12 @@ func run() error {
 	}
 
 	// 8. Establish session via capability-driven fallback chain (resume -> load -> new)
-	sessionID, err := acpClient.EstablishSession(ctx, *agentFolder, savedSession)
+	sessionID, warnings, err := acpClient.EstablishSession(ctx, *agentFolder, savedSession)
 	if err != nil {
 		return fmt.Errorf("establishing session: %w", err)
+	}
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "wackyacp: %v\n", w)
 	}
 
 	// 9. Start D112 gRPC server on stdio (dies on stdin EOF / turn end)

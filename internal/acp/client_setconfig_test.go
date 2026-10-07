@@ -8,7 +8,7 @@ import (
 )
 
 // TestClient_SetConfigOption_ForwardsAndParsesConfirmation drives the real client against
-// the acpshimbin fixture: session/setConfigOption(cinfo "model", value) must return the
+// the acpshimbin fixture: session/set_config_option(configId "model", value) must return the
 // harness's configOptions array verbatim, confirming the session-scoped model change.
 func TestClient_SetConfigOption_ForwardsAndParsesConfirmation(t *testing.T) {
 	client, proc := startShimClient(t, "")
