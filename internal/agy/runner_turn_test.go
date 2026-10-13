@@ -470,7 +470,7 @@ func TestRunTurn_DrainCannotOverlapPollTick(t *testing.T) {
 		}, nil
 	}
 
-	b := NewBridgeWithStarter(cfg, starter)
+	b := newBridge(cfg, starter)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

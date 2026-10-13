@@ -5,17 +5,20 @@ import (
 	"fmt"
 )
 
-// JSON-RPC 2.0 wire types
-type rpcRequest struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      any    `json:"id,omitempty"`
-	Method  string `json:"method,omitempty"`
-	Params  any    `json:"params,omitempty"`
+// JSON-RPC 2.0 wire types, shared by the client face (this package) and the
+// agent server face (internal/serve). ID and Params are RawMessage so ids and
+// params round-trip byte-exact: no float64 drift for numeric ids, no key
+// re-ordering for params.
+type RPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
 }
 
-type rpcResponse struct {
+type RPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      any             `json:"id,omitempty"`
+	ID      json.RawMessage `json:"id,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *RPCError       `json:"error,omitempty"`
 }
@@ -31,13 +34,10 @@ func (e *RPCError) Error() string {
 	if e == nil {
 		return ""
 	}
-	if e.Code == 0 {
-		return e.Message
-	}
 	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
 }
 
-// ConfigOptionError is returned when the harness rejects a session/setConfigOption call. Code
+// ConfigOptionError is returned when the harness rejects a session/set_config_option call. Code
 // is the JSON-RPC error code from the harness (-32602 invalid params for an unknown model or
 // unsupported config id); Message is the harness's explanation. It unwraps to ErrTurnFailed so
 // existing errors.Is checks against the sentinel keep working.
@@ -126,6 +126,12 @@ type PermissionRequestParams struct {
 	Options   []PermissionOption `json:"options"`
 }
 
+// ToolCallInfo decodes the toolCall object carried in an incoming
+// session/request_permission call. Spec fields (ACP v1 ToolCall, camelCase):
+// toolCallId, title, name, kind, rawInput. The harness-dialect aliases
+// (toolName, input, args, arguments) are sent by claude-acp and wackyagy
+// builds instead of rawInput; they must stay decodable, so they are kept as
+// wire-compatible fallbacks - dropping one is a bridge break, not a cleanup.
 type ToolCallInfo struct {
 	ToolCallID string          `json:"toolCallId"`
 	ToolName   string          `json:"toolName,omitempty"`
@@ -138,6 +144,10 @@ type ToolCallInfo struct {
 	Arguments  json.RawMessage `json:"arguments,omitempty"`
 }
 
+// inputPayload resolves the tool input across the spec and dialect field
+// names. Precedence is the contract: rawInput (spec) > input > args >
+// arguments; the first non-empty wins. Pinned by
+// TestToolCallInfo_InputPayloadPrecedence.
 func (t *ToolCallInfo) inputPayload() json.RawMessage {
 	if len(t.RawInput) > 0 {
 		return t.RawInput

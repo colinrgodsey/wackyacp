@@ -235,7 +235,7 @@ func (c *testClient) send(t *testing.T, method string, params any) int64 {
 // readResponse blocks until the response for wantID arrives, stashing id
 // frames belonging to other in-flight requests so an out-of-order response
 // (a held-open prompt settling before a busy error) is not lost.
-func (c *testClient) readResponse(t *testing.T, wantID int64) (map[string]any, *RPCError) {
+func (c *testClient) readResponse(t *testing.T, wantID int64) (map[string]any, *acp.RPCError) {
 	t.Helper()
 	for {
 		for i, line := range c.pending {
@@ -265,14 +265,14 @@ func idOf(t *testing.T, line json.RawMessage) int64 {
 	return id
 }
 
-func parseResponse(t *testing.T, line json.RawMessage) (map[string]any, *RPCError) {
+func parseResponse(t *testing.T, line json.RawMessage) (map[string]any, *acp.RPCError) {
 	t.Helper()
 	var frame map[string]json.RawMessage
 	if err := json.Unmarshal(line, &frame); err != nil {
 		t.Fatalf("malformed response: %v", err)
 	}
 	if errRaw, ok := frame["error"]; ok {
-		var e RPCError
+		var e acp.RPCError
 		if err := json.Unmarshal(errRaw, &e); err != nil {
 			t.Fatalf("malformed error object: %v", err)
 		}
@@ -286,7 +286,7 @@ func parseResponse(t *testing.T, line json.RawMessage) (map[string]any, *RPCErro
 }
 
 // request sends an ACP request and blocks until its response arrives.
-func (c *testClient) request(t *testing.T, method string, params any) (map[string]any, *RPCError) {
+func (c *testClient) request(t *testing.T, method string, params any) (map[string]any, *acp.RPCError) {
 	t.Helper()
 	id := c.send(t, method, params)
 	return c.readResponse(t, id)
@@ -748,7 +748,7 @@ func TestUnknownMethodAndMalformedLine(t *testing.T) {
 		if !ok {
 			t.Fatalf("want an error frame, got %s", line)
 		}
-		var pe RPCError
+		var pe acp.RPCError
 		if err := json.Unmarshal(errRaw, &pe); err != nil {
 			t.Fatalf("malformed error: %v", err)
 		}

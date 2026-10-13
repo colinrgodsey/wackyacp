@@ -102,7 +102,7 @@ func TestDialerRespawnsAfterChildDeath(t *testing.T) {
 	if len(ids) != 1 || !strings.HasPrefix(ids[0], "child") {
 		t.Fatalf("ListAgents: got %v", ids)
 	}
-	cmd1 := d.ActiveCmd()
+	cmd1 := d.activeCmd
 	if cmd1 == nil || cmd1.Process == nil {
 		t.Fatal("no active child after the first RPC")
 	}
@@ -113,7 +113,7 @@ func TestDialerRespawnsAfterChildDeath(t *testing.T) {
 	if err := cmd1.Process.Kill(); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
-	waitFor(t, "the dead child to be reaped", func() bool { return !d.ChildAlive() })
+	waitFor(t, "the dead child to be reaped", func() bool { return !d.childAlive() })
 
 	// The RPC racing the kill can hit the dying transport; retry until a
 	// fresh child answers (bounded, like a user retrying).
@@ -133,7 +133,7 @@ func TestDialerRespawnsAfterChildDeath(t *testing.T) {
 	if len(ids2) != 1 || !strings.HasPrefix(ids2[0], "child") {
 		t.Fatalf("ListAgents after death: got %v", ids2)
 	}
-	cmd2 := d.ActiveCmd()
+	cmd2 := d.activeCmd
 	if cmd2 == nil || cmd2.Process == nil {
 		t.Fatal("no active child after respawn")
 	}
@@ -155,10 +155,10 @@ func TestDialerFailedSpawnLeavesNoHandle(t *testing.T) {
 	if _, err := agentv1.NewAgentServiceClient(gc).ListAgents(ctx2, &agentv1.ListAgentsRequest{}); err == nil {
 		t.Fatal("want an RPC error, got nil")
 	}
-	if d.LastDialError() == nil {
+	if d.lastErr == nil {
 		t.Fatal("want a recorded spawn error")
 	}
-	if c := d.ActiveCmd(); c != nil && c.Process != nil {
+	if c := d.activeCmd; c != nil && c.Process != nil {
 		t.Fatalf("failed spawn left a child handle: %v", c)
 	}
 }

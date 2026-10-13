@@ -26,7 +26,7 @@ const cfgAgyBin = "/nonexistent/agy-under-test"
 func startBridge(t *testing.T, env testEnv, runner *scriptRunner) *harness {
 	t.Helper()
 	h := newHarness(t)
-	h.serve(NewBridgeWithStarter(env.config(), runner.starter()))
+	h.serve(newBridge(env.config(), runner.starter()))
 	return h
 }
 
@@ -130,7 +130,7 @@ func TestPromptArgvGainsConversationAndModel(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(env.stateDir, "models_cache.json"), []byte(`["Gemini 3.1 Pro (Low)"]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustOK(t, h.responseFor(h.request("session/setConfigOption", map[string]string{
+	mustOK(t, h.responseFor(h.request("session/set_config_option", map[string]string{
 		"sessionId": sessionID, "configId": "model", "value": "Gemini 3.1 Pro (Low)",
 	})))
 
@@ -244,7 +244,7 @@ func TestExtraArgsAndPrintTimeoutArePassedThrough(t *testing.T) {
 
 	cfg := env.config()
 	cfg.ExtraArgs = []string{"--experimental", "--print-timeout=5m"}
-	h.serve(NewBridgeWithStarter(cfg, runner.starter()))
+	h.serve(newBridge(cfg, runner.starter()))
 
 	sessionID := newSession(t, h)
 	mustOK(t, h.responseFor(promptID(h, sessionID, "hi")))
@@ -529,7 +529,7 @@ func TestNarrationFlagControlsPlanningLines(t *testing.T) {
 	cfg := env.config()
 	cfg.ShowNarration = true
 	h := newHarness(t)
-	h.serve(NewBridgeWithStarter(cfg, runner.starter()))
+	h.serve(newBridge(cfg, runner.starter()))
 
 	sessionID := newSession(t, h)
 	mustOK(t, h.responseFor(promptID(h, sessionID, "question")))
@@ -540,7 +540,7 @@ func TestNarrationFlagControlsPlanningLines(t *testing.T) {
 
 func TestInMemorySessionBoundDropsOldestIdle(t *testing.T) {
 	env := newTestEnv(t)
-	bridge := NewBridgeWithStarter(env.config(), (&scriptRunner{}).starter())
+	bridge := newBridge(env.config(), (&scriptRunner{}).starter())
 
 	for i := 0; i <= maxInMemorySessions; i++ {
 		bridge.setSession("s"+string(rune('a'+i%26))+string(rune('0'+i/26)), StoredSession{LastStepIdx: -1})
@@ -666,7 +666,7 @@ func TestRunTurnCancelBeforeSpawnSkipsStarter(t *testing.T) {
 		return &scriptedAgent{ctx: ctx, argv: argv, script: fatal}, nil
 	}
 
-	b := NewBridgeWithStarter(env.config(), starter)
+	b := newBridge(env.config(), starter)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel lands before the turn goroutine ever reaches the spawn
@@ -702,7 +702,7 @@ func TestPermissionModeApproveReachesTheAgentCommandLine(t *testing.T) {
 
 	cfg := env.config()
 	cfg.PermissionMode = PermissionApprove
-	h.serve(NewBridgeWithStarter(cfg, runner.starter()))
+	h.serve(newBridge(cfg, runner.starter()))
 
 	sessionID := newSession(t, h)
 	mustOK(t, h.responseFor(promptID(h, sessionID, "run something")))

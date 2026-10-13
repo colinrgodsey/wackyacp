@@ -10,7 +10,11 @@ const (
 	MethodSessionCancel            = "session/cancel"
 	MethodSessionUpdate            = "session/update"
 	MethodSessionRequestPermission = "session/request_permission"
-	MethodSessionSetConfigOption   = "session/setConfigOption"
+	// MethodSessionSetConfigOption uses the spec name (snake_case, ACP v1 schema).
+	// Harnesses in the wild accept both this and the legacy camelCase
+	// "session/setConfigOption" (the acpshimbin fixture models that); we send the
+	// spec name, and the bridge plus fixture parse both.
+	MethodSessionSetConfigOption = "session/set_config_option"
 )
 
 // ACP session/update discriminators.

@@ -213,16 +213,3 @@ func (p *Process) Close() error {
 	})
 	return p.closeErr
 }
-
-// Wait waits for the command to exit.
-func (p *Process) Wait() error {
-	return p.cmd.Wait()
-}
-
-// Pid returns the process ID of the harness subprocess.
-func (p *Process) Pid() int {
-	if p.cmd != nil && p.cmd.Process != nil {
-		return p.cmd.Process.Pid
-	}
-	return 0
-}

@@ -409,7 +409,7 @@ func isUUID(s string) bool {
 
 func TestInitializeAdvertisesCapabilities(t *testing.T) {
 	h := newHarness(t)
-	h.serve(NewBridgeWithStarter(newTestEnv(t).config(), (&scriptRunner{}).starter()))
+	h.serve(newBridge(newTestEnv(t).config(), (&scriptRunner{}).starter()))
 
 	msg := h.responseFor(h.request("initialize", map[string]any{"protocolVersion": 1}))
 	mustOK(t, msg)
@@ -442,7 +442,7 @@ func TestInitializeAdvertisesCapabilities(t *testing.T) {
 func TestSessionNewMintsUUIDAndConfig(t *testing.T) {
 	env := newTestEnv(t)
 	h := newHarness(t)
-	h.serve(NewBridgeWithStarter(env.config(), (&scriptRunner{}).starter()))
+	h.serve(newBridge(env.config(), (&scriptRunner{}).starter()))
 
 	msg := h.responseFor(h.request("session/new", map[string]any{}))
 	mustOK(t, msg)
@@ -464,7 +464,7 @@ func TestSessionNewMintsUUIDAndConfig(t *testing.T) {
 
 func TestUnknownMethodsAndMalformedLines(t *testing.T) {
 	h := newHarness(t)
-	h.serve(NewBridgeWithStarter(newTestEnv(t).config(), (&scriptRunner{}).starter()))
+	h.serve(newBridge(newTestEnv(t).config(), (&scriptRunner{}).starter()))
 
 	mustFail(t, h.responseFor(h.request("session/list", map[string]any{})), CodeMethodNotFound)
 	mustFail(t, h.responseFor(h.request("session/prompt", map[string]any{"sessionId": "missing"})), CodeServerFailure)

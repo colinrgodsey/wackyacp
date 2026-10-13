@@ -63,7 +63,7 @@ func TestStoreFilePermissions(t *testing.T) {
 	if err := store.Write("s1", StoredSession{ConversationID: "c1"}); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	info, err := os.Stat(store.Path())
+	info, err := os.Stat(store.path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,10 +74,10 @@ func TestStoreFilePermissions(t *testing.T) {
 
 func TestStoreReadRejectsCorruptFile(t *testing.T) {
 	store := NewStore(t.TempDir())
-	if err := os.MkdirAll(filepath.Dir(store.Path()), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(store.Path(), []byte("{ not json"), 0o600); err != nil {
+	if err := os.WriteFile(store.path, []byte("{ not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Read(); err == nil {
@@ -87,7 +87,7 @@ func TestStoreReadRejectsCorruptFile(t *testing.T) {
 
 func TestStoreWriteReplacesCorruptFile(t *testing.T) {
 	store := NewStore(t.TempDir())
-	if err := os.WriteFile(store.Path(), []byte("garbage"), 0o600); err != nil {
+	if err := os.WriteFile(store.path, []byte("garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Write("s1", StoredSession{ConversationID: "c1"}); err != nil {
@@ -104,7 +104,7 @@ func TestStoreWriteReplacesCorruptFile(t *testing.T) {
 
 func TestStoreEmptyFileReadsAsEmpty(t *testing.T) {
 	store := NewStore(t.TempDir())
-	if err := os.WriteFile(store.Path(), nil, 0o600); err != nil {
+	if err := os.WriteFile(store.path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	sessions, err := store.Read()

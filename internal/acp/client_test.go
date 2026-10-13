@@ -94,7 +94,7 @@ func TestClient_EstablishSession_ResumeOk(t *testing.T) {
 		AgentFolder: agentDir,
 	}
 
-	sessionID, err := client.EstablishSession(ctx, agentDir, saved)
+	sessionID, _, err := client.EstablishSession(ctx, agentDir, saved)
 	if err != nil {
 		t.Fatalf("EstablishSession failed: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestClient_EstablishSession_FailResume_FallbackLoad(t *testing.T) {
 	}
 
 	// Should attempt resume, fail, then attempt load and succeed
-	sessionID, err := client.EstablishSession(ctx, agentDir, saved)
+	sessionID, _, err := client.EstablishSession(ctx, agentDir, saved)
 	if err != nil {
 		t.Fatalf("EstablishSession failed: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestClient_EstablishSession_FailLoad_FallbackNew(t *testing.T) {
 	}
 
 	// Should attempt resume (fails), load (fails), then new (succeeds)
-	sessionID, err := client.EstablishSession(ctx, agentDir, saved)
+	sessionID, _, err := client.EstablishSession(ctx, agentDir, saved)
 	if err != nil {
 		t.Fatalf("EstablishSession failed: %v", err)
 	}
@@ -213,9 +213,15 @@ func TestClient_EstablishSession_HarnessMismatchFallsBackToNew(t *testing.T) {
 		AgentFolder: agentDir,
 	}
 
-	sessionID, err := client.EstablishSession(context.Background(), agentDir, saved)
+	sessionID, warnings, err := client.EstablishSession(context.Background(), agentDir, saved)
 	if err != nil {
 		t.Fatalf("EstablishSession failed: %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 mismatch warning, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0].Error(), "session ownership mismatch on resume") {
+		t.Errorf("warning = %q, want resume mismatch", warnings[0].Error())
 	}
 	if sessionID != "fresh-session-after-mismatch" {
 		t.Errorf("expected fresh-session-after-mismatch, got: %s", sessionID)

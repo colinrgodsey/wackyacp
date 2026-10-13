@@ -42,7 +42,7 @@ func TestHarnessLifecycle(t *testing.T) {
 	}
 	defer proc.Close()
 
-	if proc.Pid() == 0 {
+	if proc.cmd.Process.Pid == 0 {
 		t.Fatalf("expected non-zero pid")
 	}
 
@@ -83,7 +83,7 @@ func TestHarnessCancel(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 
-	err = proc.Wait()
+	err = proc.cmd.Wait()
 	if err == nil {
 		t.Fatalf("expected process to terminate with error on cancel")
 	}
