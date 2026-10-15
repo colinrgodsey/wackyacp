@@ -573,6 +573,9 @@ func (c *Client) handleIncomingNotification(line []byte) {
 			}
 		}
 
+	case UpdateKindSessionInfoUpdate, UpdateKindAvailableCommandsUpdate, UpdateKindAgentThoughtChunk:
+		// These ACP updates are informational and have no D112 counterpart.
+
 	default:
 		// Forward unmapped updates as warnings (per D117 and claude review)
 		if turn.callbacks.OnWarning != nil {

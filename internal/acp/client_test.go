@@ -441,6 +441,64 @@ func (h *pipeMockHarness) sendPromptResponse(id int64, stopReason string) {
 	_, _ = fmt.Fprintf(h.inWriter, "%s\n", data)
 }
 
+func TestClient_InformationalSessionUpdatesDoNotWarn(t *testing.T) {
+	tests := []struct {
+		name        string
+		updateKind  string
+		wantWarning string
+	}{
+		{name: "session info", updateKind: UpdateKindSessionInfoUpdate},
+		{name: "available commands", updateKind: UpdateKindAvailableCommandsUpdate},
+		{name: "agent thought", updateKind: UpdateKindAgentThoughtChunk},
+		{name: "unknown update", updateKind: "future_unknown_update", wantWarning: "unmapped acp session update: future_unknown_update"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mock, cleanup := newPipeMockHarness(t)
+			defer cleanup()
+
+			var (
+				warningsMu sync.Mutex
+				warnings   []string
+			)
+			callbacks := TurnCallbacks{
+				OnWarning: func(warning string) error {
+					warningsMu.Lock()
+					warnings = append(warnings, warning)
+					warningsMu.Unlock()
+					return nil
+				},
+			}
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, id := mock.readRequest()
+				mock.sendUpdate("sess-1", map[string]any{"sessionUpdate": tt.updateKind})
+				mock.sendPromptResponse(id, "end_turn")
+			}()
+
+			if _, err := client.Prompt(context.Background(), "sess-1", "hi", callbacks); err != nil {
+				t.Fatalf("Prompt failed: %v", err)
+			}
+			<-done
+
+			warningsMu.Lock()
+			defer warningsMu.Unlock()
+			if tt.wantWarning == "" {
+				if len(warnings) != 0 {
+					t.Fatalf("expected no warnings, got %v", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 || warnings[0] != tt.wantWarning {
+				t.Fatalf("warnings = %v, want [%q]", warnings, tt.wantWarning)
+			}
+		})
+	}
+}
+
 func TestClient_Coalesce_DeltaFragmentsJoinContiguously(t *testing.T) {
 	client, harness, cleanup := newPipeMockHarness(t)
 	defer cleanup()

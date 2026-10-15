@@ -25,3 +25,20 @@ func TestMethodNamesMatchSpec(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateKindNamesMatchSpec(t *testing.T) {
+	got := map[string]string{
+		"agent_message_chunk":       UpdateKindAgentMessageChunk,
+		"usage_update":              UpdateKindUsageUpdate,
+		"tool_call":                 UpdateKindToolCall,
+		"tool_call_update":          UpdateKindToolCallUpdate,
+		"session_info_update":       UpdateKindSessionInfoUpdate,
+		"available_commands_update": UpdateKindAvailableCommandsUpdate,
+		"agent_thought_chunk":       UpdateKindAgentThoughtChunk,
+	}
+	for want, name := range got {
+		if name != want {
+			t.Errorf("update kind %s = %q, want %q", want, name, want)
+		}
+	}
+}
