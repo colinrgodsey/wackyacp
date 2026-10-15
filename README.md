@@ -74,7 +74,8 @@ not shown in the REMOTE_MANIFEST example above:
   and the default when the flag is absent from a manifest line. `approve` auto-approves
   every request; that means the harness can run tools and touch files with no prompt,
   so use it only for trusted local harnesses (e.g. a review bot in a sandbox).
-  Dispatch-mode only; the model CLI and serve mode read their own copy of the flag.
+  Read by dispatch mode and the model CLI. Serve mode does NOT accept it: the
+  serve parser rejects unknown flags, and serve never spawns a harness to ask.
 
 ### `wackyacp model get|set`
 
@@ -98,13 +99,17 @@ wackyacp model set --agent-folder=/abs/path/to/agy deepseek-v4-pro
   the JSON-RPC code (`{"error": ..., "code": -32602}`).
 - Takes the per-agent session lock so it cannot interleave with a live turn.
 
-### Per-session model selection in serve mode
+### Per-session model selection (`/model` slash passthrough)
 
-While a serve-mode session is open, an ACP client can change its model at any time by
-sending `session/set_config_option` with `configId: "model"` (the harness's session
-config passthrough). The active turn and all later turns in that session use the new
-model; it is scoped to the session, not the agent folder - another session talking to
-the same agent keeps its own model unless it also sets one.
+In dispatch/bridge mode, a user prompt of the form `/model <id>` (or `/model` alone to
+query) is intercepted by the bridge's d112 server before it reaches the harness: the
+prompt becomes a `session/set_config_option` with `configId: "model"` on the harness
+session, and the harness's confirmation is returned as the turn text. This is the
+per-session model selection surface - the model is scoped to the harness session, not
+the agent folder, so another session talking to the same agent keeps its own model
+unless it also selects one. Serve mode does NOT expose this: the serve parser implements
+only the ACP methods in its capabilities (initialize/new/load/prompt/cancel/close) and
+answers anything else with method-not-found.
 
 ### `wackyacp serve` (inverted ACP server)
 
