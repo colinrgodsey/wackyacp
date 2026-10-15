@@ -573,7 +573,7 @@ func (c *Client) handleIncomingNotification(line []byte) {
 			}
 		}
 
-	case "session_info_update", "available_commands_update":
+	case UpdateKindSessionInfoUpdate, UpdateKindAvailableCommandsUpdate, UpdateKindAgentThoughtChunk:
 		// These ACP updates are informational and have no D112 counterpart.
 
 	default:
