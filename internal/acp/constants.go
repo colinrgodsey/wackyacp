@@ -19,10 +19,12 @@ const (
 
 // ACP session/update discriminators.
 const (
-	UpdateKindAgentMessageChunk = "agent_message_chunk"
-	UpdateKindUsageUpdate       = "usage_update"
-	UpdateKindToolCall          = "tool_call"
-	UpdateKindToolCallUpdate    = "tool_call_update"
+	UpdateKindAgentMessageChunk       = "agent_message_chunk"
+	UpdateKindUsageUpdate             = "usage_update"
+	UpdateKindToolCall                = "tool_call"
+	UpdateKindToolCallUpdate          = "tool_call_update"
+	UpdateKindSessionInfoUpdate       = "session_info_update"
+	UpdateKindAvailableCommandsUpdate = "available_commands_update"
 )
 
 // ACP tool execution statuses (mirroring ACP spec).
