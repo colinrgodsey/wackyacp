@@ -25,6 +25,7 @@ type modelOptions struct {
 	harnessCmd     string
 	harnessArgs    string
 	permissionMode string
+	help           bool
 }
 
 func parseModelArgs(args []string) (*modelOptions, error) {
@@ -71,11 +72,17 @@ func parseModelArgs(args []string) (*modelOptions, error) {
 				opts.permissionMode = args[i+1]
 				i++
 			}
+		case arg == "--help" || arg == "-h":
+			opts.help = true
 		case strings.HasPrefix(arg, "-"):
 			return nil, fmt.Errorf("unknown flag: %s", arg)
 		default:
 			positionals = append(positionals, arg)
 		}
+	}
+
+	if opts.help {
+		return opts, nil
 	}
 
 	// Filter out "model" from positionals if it appears as the first command token
@@ -137,6 +144,10 @@ func runModel(args []string) error {
 	opts, err := parseModelArgs(args)
 	if err != nil {
 		return emitJSONError("", err)
+	}
+	if opts.help {
+		printModelUsage()
+		return nil
 	}
 
 	if opts.verb == "set" && opts.modelArg == "" {
@@ -244,4 +255,25 @@ func runModel(args []string) error {
 	}
 	fmt.Println(string(respJSON))
 	return nil
+}
+
+// printModelUsage writes the model CLI usage to stdout. The model CLI's ordinary
+// output is JSON on stdout (the machine contract); help is the one human-readable
+// stdout exception, so piping automatically captures usage instead of failing.
+func printModelUsage() {
+	fmt.Println("usage: wackyacp model get|set [flags] [model]")
+	fmt.Println("")
+	fmt.Println("Inspect or select the per-session model for an agent folder (ACP config-option passthrough).")
+	fmt.Println("")
+	fmt.Println("commands:")
+	fmt.Println("  get          print the current model and config options as JSON")
+	fmt.Println("  set <model>  set the session model; prints the confirmed model as JSON")
+	fmt.Println("")
+	fmt.Println("flags:")
+	fmt.Println("  --agent-folder <path>   agent folder (absolute; canonical). Requires --harness-cmd.")
+	fmt.Println("                          --workspace and -w are deprecated aliases.")
+	fmt.Println("  --harness-cmd <cmd>     harness binary (e.g. agy, npx); resolved via LookPath.")
+	fmt.Println("  --harness-args <args>   extra harness args, shell-quoted (shlex-split).")
+	fmt.Println("  --permission-mode <m>   deny (default) or approve; how to answer request_permission.")
+	fmt.Println("  -h, --help              show this help.")
 }

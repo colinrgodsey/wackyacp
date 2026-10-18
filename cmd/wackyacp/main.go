@@ -21,6 +21,15 @@ func run() error {
 	harnessArgs := flag.String("harness-args", "", "Arguments for the harness command")
 	agentFolder := flag.String("agent-folder", "", "Absolute path to the agent folder")
 	permissionMode := flag.String("permission-mode", "deny", "How to answer session/request_permission from the harness: deny (D117 default, auto-deny) or approve (auto-approve; trusted local harnesses only)")
+
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: wackyacp [flags] (bridge dispatch mode)")
+		fmt.Fprintln(os.Stderr, "       wackyacp serve [flags]   (inverted ACP server, see: wackyacp serve --help)")
+		fmt.Fprintln(os.Stderr, "       wackyacp model get|set [flags] [model]   (per-agent model, see: wackyacp model --help)")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "bridge dispatch flags:")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	// 1. Validate agent-folder: must be absolute, NO CWD-based fallback (D117 Decision)

@@ -374,3 +374,14 @@ func TestRunServeTCPClosesIdleConnsOnShutdown(t *testing.T) {
 		t.Fatal("conn close not observed: read timed out instead of returning a close error")
 	}
 }
+func TestServe_HelpPrintsUsageAndExitsZero(t *testing.T) {
+	wackyacpBin := getWackyacpBin(t)
+	cmd := exec.Command(wackyacpBin, "serve", "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --help failed: %v", err)
+	}
+	if !strings.Contains(string(out), "usage: wackyacp serve [flags]") {
+		t.Errorf("expected usage text, got: %s", string(out))
+	}
+}
