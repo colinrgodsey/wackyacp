@@ -283,3 +283,14 @@ func TestIsModelCommand(t *testing.T) {
 		}
 	}
 }
+func TestCLI_Model_HelpPrintsUsageAndExitsZero(t *testing.T) {
+	wackyacpBin := getWackyacpBin(t)
+	cmd := exec.Command(wackyacpBin, "model", "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("model --help failed: %v\nOutput: %s", err, string(out))
+	}
+	if !strings.Contains(string(out), "usage: wackyacp model get|set") {
+		t.Errorf("expected usage text, got: %s", string(out))
+	}
+}

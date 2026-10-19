@@ -54,7 +54,105 @@ claude-review: wackyacp --harness-cmd=npx --harness-args='-y @agentclientprotoco
 
 Per-turn flow: acquire `acp-session.lock` → read/verify session file → spawn harness (process-group isolated) → ACP `initialize` → resume/load/new → serve D112 on stdio until stdin EOF → release lock, reap child. Delete `acp-session.json` to reset an agent, exactly like deleting `session.jsonl` resets a native one.
 
-`wackyagy` flags: `--agy-bin` (default `/usr/local/bin/agy`, then `agy` on PATH), `--workdir`, `--conversations-dir` (default `~/.gemini/antigravity-cli/conversations`), `--state-dir` (default `~/.wackyacp/agy-acp`), `--log-dir` (default `~/.gemini/antigravity-cli/log`), `--extra-args` (also `AGY_EXTRA_ARGS`), `--print-timeout` (default `20m`), `--poll-interval` (default `100ms`), `--show-narration` (also `AGY_SHOW_NARRATION`), `--version`. Diagnostics go to stderr; protocol messages only on stdout.
+`wackyagy` flags and defaults are documented by `wackyagy --help`. Diagnostics go to stderr; protocol messages only on stdout.
+
+## CLI surface
+
+The CLI carries its own flag documentation: every surface prints its full flag
+catalog on request. The README below only points at those and records the
+behavioral contracts the help text cannot convey.
+
+```bash
+wackyacp --help                 # bridge dispatch mode (harness flags)
+wackyacp serve --help           # serve mode: stdio, TCP, and --remote dial
+wackyacp model --help           # model get|set
+wackyagy --help                 # wackyagy bridge flags
+```
+
+### Bridge / dispatch mode
+
+Driven by wackypub dispatch (REMOTE_MANIFEST line), not by hand - the flags are
+the contract:
+
+```bash
+agy:           wackyacp --harness-cmd=agy --harness-args='--prompt' --agent-folder=/abs/path/to/agy
+claude-review: wackyacp --harness-cmd=npx --harness-args='-y @agentclientprotocol/claude-agent-acp' --agent-folder=/abs/path/to/claude-review
+```
+
+`--agent-folder` must be absolute (no CWD fallback, by decision). Per-turn flow:
+acquire `acp-session.lock` -> read/verify session file -> spawn harness
+(process-group isolated) -> ACP `initialize` -> resume/load/new -> serve D112 on
+stdio until stdin EOF -> release lock, reap child. Delete `acp-session.json` to
+reset an agent. `--permission-mode deny` (D117 default) auto-denies harness
+permission requests with a warning chunk; `approve` grants everything, so it is
+only for trusted local harnesses. It is read by dispatch mode and the model CLI;
+serve mode does not accept it (no harness to ask).
+
+### `wackyacp model get|set`
+
+Per-agent model inspection/selection (ACP config-option passthrough):
+
+```bash
+wackyacp model get --agent-folder=/abs/path/to/agy
+wackyacp model set --agent-folder=/abs/path/to/agy deepseek-v4-pro
+```
+
+- `--agent-folder` is canonical; `--workspace` / `-w` are deprecated aliases.
+  Without it the current directory is used and made absolute.
+- Output is one JSON line on stdout (the machine contract). Errors go to stderr
+  AND a `{"error": ...}` line on stdout with a non-zero exit; harness
+  config-option rejections carry the JSON-RPC code (`{"error": ..., "code": -32602}`).
+- Takes the per-agent session lock so it cannot interleave with a live turn.
+
+### Per-session model selection (`/model` slash passthrough)
+
+In dispatch/bridge mode, a user prompt of the form `/model <id>` (or `/model`
+alone to query) is intercepted by the bridge d112 server before it reaches the
+harness: the prompt becomes a `session/set_config_option` with `configId:
+"model"` on the harness session, and the harness confirmation is returned as
+the turn text. The model is scoped to the harness session, not the agent folder.
+Serve mode does not expose this: it implements only initialize/new/load/prompt/
+cancel/close and answers anything else with method-not-found.
+
+### `wackyacp serve` (inverted ACP server)
+
+```bash
+# stdio mode: serve an agent folder over ACP on stdin/stdout
+wackyacp serve --agent-folder=/abs/path/to/agy
+# TCP mode: ACP on a listener (ACP sessions have NO auth - loopback only!)
+wackyacp serve --agent-folder=/abs/path/to/agy --host=127.0.0.1 --port=10023
+```
+
+- Reads ACP JSON-RPC 2.0 lines from stdin (stdio) or a socket (TCP). `--host`
+  defaults to 127.0.0.1; binding a non-loopback host prints a loud warning that
+  ACP has no authentication. `--port 0` (or omitted) selects stdio mode.
+- **Shutdown**: stdio mode exits on stdin EOF (clean), reading stdin on a
+  scanner goroutine so shutdown never hangs; TCP mode closes the listener and
+  active connections on SIGTERM so Accept/Read wake immediately and the child is
+  reaped rather than orphaned.
+- **Cancel lifecycle**: `session/cancel` is a notification (no response, per
+  spec); it is idempotent - cancelling with no turn in flight is a no-op,
+  cancelling an in-flight turn cancels exactly that turn, and the stream for a
+  cancelled turn ends rather than spinning. The cancel is process-wide: any
+  connection may cancel the agent in-flight turn.
+
+### `wackyacp serve --remote` (dial a wackypub tcp-serve endpoint)
+
+Serve-mode without a local agent folder - the conversation lives on a remote or
+local wackypub tcp-serve host, identified by agent id:
+
+```bash
+# wackypub tcp-serve on node2 serves agent "agy" (tcp-serve --listen :8423, WACKYPUB_SERVE_TOKEN set)
+wackyacp serve --remote=node2:8423 --agent-id=agy --token=$WACKYPUB_SERVE_TOKEN
+# or a wackypub tcp-serve on the same host
+wackyacp serve --remote=127.0.0.1:8423 --agent-id=agy
+```
+
+- `--remote host:port` dials the wackypub AgentService (D112) over TCP; requires
+  `--agent-id` and is mutually exclusive with `--agent-folder` (the folder stays
+  on the remote host). `--token` falls back to `WACKYPUB_SERVE_TOKEN` env.
+- No local workspace is required and no child wackypub is spawned: the server is
+  an ACP-to-D112 translator with the session id derived from the agent id.
 
 ## Clients
 

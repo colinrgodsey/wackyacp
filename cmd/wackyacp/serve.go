@@ -27,6 +27,7 @@ type serveOptions struct {
 	remote      string // --remote host:port (remote wackypub tcp-serve endpoint)
 	agentID     string // --agent-id (remote mode identity; routing-proxy native)
 	token       string // --token (remote bearer secret; env fallback WACKYPUB_SERVE_TOKEN)
+	help        bool   // --help/-h: print usage and exit
 }
 
 func parseServeArgs(args []string) (*serveOptions, error) {
@@ -100,6 +101,8 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 			}
 			opts.token = args[i+1]
 			i++
+		case arg == "--help" || arg == "-h":
+			opts.help = true
 		case strings.HasPrefix(arg, "-"):
 			return nil, fmt.Errorf("unknown flag: %s", arg)
 		default:
@@ -117,6 +120,10 @@ func parseServeArgs(args []string) (*serveOptions, error) {
 	}
 	if len(cleanPos) > 0 {
 		return nil, fmt.Errorf("unexpected argument: %s", cleanPos[0])
+	}
+
+	if opts.help {
+		return opts, nil
 	}
 
 	if opts.remote != "" {
@@ -150,6 +157,10 @@ func runServe(args []string) error {
 	opts, err := parseServeArgs(args)
 	if err != nil {
 		return err
+	}
+	if opts.help {
+		printServeUsage()
+		return nil
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -339,4 +350,27 @@ func runServeTCP(ctx context.Context, backend *serve.Backend, opts *serveOptions
 			removeConn(conn)
 		}()
 	}
+}
+
+// printServeUsage writes the serve CLI usage to stdout (help is the one
+// human-readable stdout exception from the otherwise-stderr surface).
+func printServeUsage() {
+	fmt.Println("usage: wackyacp serve [flags]")
+	fmt.Println("")
+	fmt.Println("Serve an agent as an in-process ACP server backed by wackypub (local child or remote tcp-serve).")
+	fmt.Println("")
+	fmt.Println("modes:")
+	fmt.Println("  stdio (default)        ACP JSON-RPC 2.0 on stdin/stdout; exits on stdin EOF")
+	fmt.Println("  tcp (--host/--port)    ACP on a listener; SIGTERM closes the listener and active connections to drain")
+	fmt.Println("  remote (--remote)      dial a wackypub tcp-serve endpoint by --agent-id (no local folder)")
+	fmt.Println("")
+	fmt.Println("flags:")
+	fmt.Println("  --agent-folder <path>   local agent folder (absolute; no CWD fallback). Mutually exclusive with --remote.")
+	fmt.Println("  --wackypub-bin <bin>    wackypub binary backing a local session (default wackypub on PATH)")
+	fmt.Println("  --host <host>           TCP bind host (default 127.0.0.1; non-loopback prints a no-auth warning)")
+	fmt.Println("  --port <port>           TCP port; 0 or omitted = stdio mode")
+	fmt.Println("  --remote <host:port>    dial a wackypub tcp-serve endpoint instead of a local child")
+	fmt.Println("  --agent-id <id>         agent id the remote tcp-serve hosts (required with --remote)")
+	fmt.Println("  --token <token>         bearer token for the remote endpoint (env WACKYPUB_SERVE_TOKEN)")
+	fmt.Println("  -h, --help              show this help")
 }
