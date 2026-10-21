@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/colinrgodsey/wackyacp/internal/acp"
+	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"github.com/colinrgodsey/wackypub/pkg/stdio"
 	"google.golang.org/grpc"
@@ -349,6 +351,220 @@ func (s *Server) InspectAgent(ctx context.Context, req *agentv1.InspectAgentRequ
 		AgentDir:       s.agentFolder,
 		AgentDirExists: true,
 	}, nil
+}
+
+func (s *Server) resolveAgentDir(agentID, reqWsDir string) string {
+	cleanedFolder := filepath.Clean(s.agentFolder)
+	if agentID == "" || agentID == filepath.Base(cleanedFolder) {
+		if reqWsDir != "" {
+			return filepath.Join(reqWsDir, filepath.Base(cleanedFolder))
+		}
+		return cleanedFolder
+	}
+	wsDir := reqWsDir
+	if wsDir == "" {
+		wsDir = filepath.Dir(cleanedFolder)
+	}
+	return filepath.Join(wsDir, agentID)
+}
+
+func (s *Server) CreateScratchpad(ctx context.Context, req *agentv1.CreateScratchpadRequest) (*agentv1.CreateScratchpadResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	text := req.GetText()
+	data := req.GetData()
+	if text == "" && len(data) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "scratchpad content cannot be empty")
+	}
+	if text != "" && len(data) > 0 {
+		return nil, status.Error(codes.InvalidArgument, "scratchpad text and data are mutually exclusive")
+	}
+
+	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	createdBy := req.GetCreatedBy()
+	if createdBy == "" {
+		createdBy = "cli"
+	}
+
+	var entry *agent.ScratchpadEntry
+	var err error
+	if len(data) > 0 {
+		entry, err = agent.CreateBinaryScratchpad(agentDir, data, createdBy, req.GetMimeType())
+	} else {
+		entry, err = agent.CreateScratchpad(agentDir, text, createdBy)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	warnings := entry.Warnings
+	if len(warnings) == 0 && entry.Warning != "" {
+		warnings = []string{entry.Warning}
+	}
+
+	pbEntry := &agentv1.ScratchpadEntry{
+		EntryId:   entry.ID,
+		Size:      int64(entry.Size),
+		Lines:     int32(entry.Lines),
+		CreatedBy: entry.CreatedBy,
+		Text:      entry.Text,
+		IsBinary:  entry.IsBinary,
+		MimeType:  entry.MIMEType,
+		Warnings:  warnings,
+	}
+	return &agentv1.CreateScratchpadResponse{
+		Entry: pbEntry,
+	}, nil
+}
+
+func (s *Server) GetScratchpad(ctx context.Context, req *agentv1.GetScratchpadRequest) (*agentv1.GetScratchpadResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	entryID := req.GetEntryId()
+	if entryID == "" {
+		return nil, status.Error(codes.InvalidArgument, "entryId cannot be empty")
+	}
+
+	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+
+	var skipPtr, numPtr *int
+	if req.SkipLines != nil {
+		skip := int(*req.SkipLines)
+		skipPtr = &skip
+	}
+	if req.NumLines != nil {
+		num := int(*req.NumLines)
+		numPtr = &num
+	}
+
+	text, err := agent.GetScratchpad(agentDir, entryID, skipPtr, numPtr)
+	if err != nil {
+		return nil, err
+	}
+	return &agentv1.GetScratchpadResponse{
+		Text: text,
+	}, nil
+}
+
+func (s *Server) ListScratchpads(ctx context.Context, req *agentv1.ListScratchpadsRequest) (*agentv1.ListScratchpadsResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+
+	items, count, capVal, err := agent.ListScratchpads(agentDir)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]*agentv1.ScratchpadEntry, len(items))
+	for i, item := range items {
+		entries[i] = &agentv1.ScratchpadEntry{
+			EntryId:   item.ID,
+			Size:      int64(item.Size),
+			Lines:     int32(item.Lines),
+			CreatedBy: item.CreatedBy,
+			IsBinary:  item.IsBinary,
+			MimeType:  item.MIMEType,
+		}
+	}
+
+	return &agentv1.ListScratchpadsResponse{
+		Entries:      entries,
+		TotalEntries: int32(count),
+		MaxCapacity:  int32(capVal),
+	}, nil
+}
+
+func (s *Server) SearchScratchpad(ctx context.Context, req *agentv1.SearchScratchpadRequest) (*agentv1.SearchScratchpadResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	entryID := req.GetEntryId()
+	if entryID == "" {
+		return nil, status.Error(codes.InvalidArgument, "entryId cannot be empty")
+	}
+	query := req.GetQuery()
+	if query == "" {
+		return nil, status.Error(codes.InvalidArgument, "query cannot be empty")
+	}
+
+	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+
+	var caseSensPtr *bool
+	if req.CaseSensitive != nil {
+		val := *req.CaseSensitive
+		caseSensPtr = &val
+	}
+
+	res, err := agent.SearchScratchpad(agentDir, entryID, query, caseSensPtr, req.GetUseRegex(), int(req.GetMaxResults()))
+	if err != nil {
+		return nil, err
+	}
+
+	matches := make([]*agentv1.ScratchpadMatch, len(res.Matches))
+	for i, m := range res.Matches {
+		matches[i] = &agentv1.ScratchpadMatch{
+			Line:      int32(m.Line),
+			SkipLines: int32(m.SkipLines),
+			Text:      m.Text,
+		}
+	}
+
+	return &agentv1.SearchScratchpadResponse{
+		EntryId:      res.ID,
+		Query:        res.Query,
+		TotalMatches: int32(res.TotalMatches),
+		MaxResults:   int32(res.MaxResults),
+		Matches:      matches,
+	}, nil
+}
+
+func (s *Server) DiffScratchpadEntries(ctx context.Context, req *agentv1.DiffScratchpadEntriesRequest) (*agentv1.DiffScratchpadEntriesResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	beforeID := req.GetBeforeEntryId()
+	afterID := req.GetAfterEntryId()
+	if beforeID == "" || afterID == "" {
+		return nil, status.Error(codes.InvalidArgument, "beforeEntryId and afterEntryId cannot be empty")
+	}
+
+	cleanedFolder := filepath.Clean(s.agentFolder)
+	wsDir := req.GetWorkspaceDir()
+	if wsDir == "" {
+		wsDir = filepath.Dir(cleanedFolder)
+	}
+	agentID := req.GetAgentId()
+	if agentID == "" {
+		agentID = filepath.Base(cleanedFolder)
+	}
+
+	diff, err := agent.DiffScratchpadEntries(wsDir, agentID, beforeID, afterID)
+	if err != nil {
+		return nil, err
+	}
+	return &agentv1.DiffScratchpadEntriesResponse{
+		Diff: diff,
+	}, nil
+}
+
+func (s *Server) DeleteScratchpad(ctx context.Context, req *agentv1.DeleteScratchpadRequest) (*agentv1.DeleteScratchpadResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+	entryID := req.GetEntryId()
+	if entryID == "" {
+		return nil, status.Error(codes.InvalidArgument, "entryId cannot be empty")
+	}
+
+	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err := agent.DeleteScratchpad(agentDir, entryID); err != nil {
+		return nil, err
+	}
+	return &agentv1.DeleteScratchpadResponse{}, nil
 }
 
 // ServeStdio registers the D112 server and serves gRPC over stdin/stdout until
