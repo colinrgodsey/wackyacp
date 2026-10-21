@@ -1,10 +1,12 @@
 package d112
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -353,19 +355,63 @@ func (s *Server) InspectAgent(ctx context.Context, req *agentv1.InspectAgentRequ
 	}, nil
 }
 
-func (s *Server) resolveAgentDir(agentID, reqWsDir string) string {
+func (s *Server) resolveAgentDir(agentID, reqWsDir string) (string, error) {
 	cleanedFolder := filepath.Clean(s.agentFolder)
-	if agentID == "" || agentID == filepath.Base(cleanedFolder) {
+	callerAgentID := filepath.Base(cleanedFolder)
+
+	// Same-agent access is always permitted
+	if agentID == "" || agentID == callerAgentID {
 		if reqWsDir != "" {
-			return filepath.Join(reqWsDir, filepath.Base(cleanedFolder))
+			return filepath.Join(reqWsDir, callerAgentID), nil
 		}
-		return cleanedFolder
+		return cleanedFolder, nil
 	}
+
+	// Cross-agent access: enforce caller's WACKYPUB_ALLOWED_AGENTS allowlist (D16, D60)
+	allowedPath := filepath.Join(cleanedFolder, agent.AllowedAgentsFile)
+	allowedAgents, err := readAllowedAgentsFile(allowedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", status.Errorf(codes.PermissionDenied, "access to agent %q denied: current agent directory %q has no %s allowlist", agentID, cleanedFolder, agent.AllowedAgentsFile)
+		}
+		return "", status.Errorf(codes.Internal, "failed to read %s: %v", allowedPath, err)
+	}
+
+	authorized := false
+	for _, id := range allowedAgents {
+		if id == agentID || id == "*" {
+			authorized = true
+			break
+		}
+	}
+	if !authorized {
+		return "", status.Errorf(codes.PermissionDenied, "agent %q is not in %s allowlist for current agent directory %q", agentID, agent.AllowedAgentsFile, cleanedFolder)
+	}
+
 	wsDir := reqWsDir
 	if wsDir == "" {
 		wsDir = filepath.Dir(cleanedFolder)
 	}
-	return filepath.Join(wsDir, agentID)
+	return filepath.Join(wsDir, agentID), nil
+}
+
+func readAllowedAgentsFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var result []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		result = append(result, line)
+	}
+	return result, scanner.Err()
 }
 
 func (s *Server) CreateScratchpad(ctx context.Context, req *agentv1.CreateScratchpadRequest) (*agentv1.CreateScratchpadResponse, error) {
@@ -381,14 +427,16 @@ func (s *Server) CreateScratchpad(ctx context.Context, req *agentv1.CreateScratc
 		return nil, status.Error(codes.InvalidArgument, "scratchpad text and data are mutually exclusive")
 	}
 
-	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	agentDir, err := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err != nil {
+		return nil, err
+	}
 	createdBy := req.GetCreatedBy()
 	if createdBy == "" {
-		createdBy = "cli"
+		createdBy = "create_scratchpad"
 	}
 
 	var entry *agent.ScratchpadEntry
-	var err error
 	if len(data) > 0 {
 		entry, err = agent.CreateBinaryScratchpad(agentDir, data, createdBy, req.GetMimeType())
 	} else {
@@ -427,7 +475,10 @@ func (s *Server) GetScratchpad(ctx context.Context, req *agentv1.GetScratchpadRe
 		return nil, status.Error(codes.InvalidArgument, "entryId cannot be empty")
 	}
 
-	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	agentDir, err := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err != nil {
+		return nil, err
+	}
 
 	var skipPtr, numPtr *int
 	if req.SkipLines != nil {
@@ -452,7 +503,10 @@ func (s *Server) ListScratchpads(ctx context.Context, req *agentv1.ListScratchpa
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
 	}
-	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	agentDir, err := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err != nil {
+		return nil, err
+	}
 
 	items, count, capVal, err := agent.ListScratchpads(agentDir)
 	if err != nil {
@@ -491,7 +545,10 @@ func (s *Server) SearchScratchpad(ctx context.Context, req *agentv1.SearchScratc
 		return nil, status.Error(codes.InvalidArgument, "query cannot be empty")
 	}
 
-	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	agentDir, err := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err != nil {
+		return nil, err
+	}
 
 	var caseSensPtr *bool
 	if req.CaseSensitive != nil {
@@ -532,17 +589,12 @@ func (s *Server) DiffScratchpadEntries(ctx context.Context, req *agentv1.DiffScr
 		return nil, status.Error(codes.InvalidArgument, "beforeEntryId and afterEntryId cannot be empty")
 	}
 
-	cleanedFolder := filepath.Clean(s.agentFolder)
-	wsDir := req.GetWorkspaceDir()
-	if wsDir == "" {
-		wsDir = filepath.Dir(cleanedFolder)
-	}
-	agentID := req.GetAgentId()
-	if agentID == "" {
-		agentID = filepath.Base(cleanedFolder)
+	agentDir, err := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err != nil {
+		return nil, err
 	}
 
-	diff, err := agent.DiffScratchpadEntries(wsDir, agentID, beforeID, afterID)
+	diff, err := agent.DiffScratchpadEntries(filepath.Dir(agentDir), filepath.Base(agentDir), beforeID, afterID)
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +612,10 @@ func (s *Server) DeleteScratchpad(ctx context.Context, req *agentv1.DeleteScratc
 		return nil, status.Error(codes.InvalidArgument, "entryId cannot be empty")
 	}
 
-	agentDir := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	agentDir, err := s.resolveAgentDir(req.GetAgentId(), req.GetWorkspaceDir())
+	if err != nil {
+		return nil, err
+	}
 	if err := agent.DeleteScratchpad(agentDir, entryID); err != nil {
 		return nil, err
 	}
