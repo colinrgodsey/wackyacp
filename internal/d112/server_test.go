@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/colinrgodsey/wackyacp/internal/acp"
+	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -100,9 +104,13 @@ func (m *mockACPDriver) LastConfigOptions() json.RawMessage {
 }
 
 func setupTestServer(driver ACPDriver) (agentv1.AgentServiceClient, func()) {
+	return setupTestServerWithFolder(driver, "/path/to/agent")
+}
+
+func setupTestServerWithFolder(driver ACPDriver, folder string) (agentv1.AgentServiceClient, func()) {
 	lis := bufconn.Listen(1024 * 1024)
 	srv := grpc.NewServer()
-	d112Srv := NewServer(driver, "test-session-123", "/path/to/agent")
+	d112Srv := NewServer(driver, "test-session-123", folder)
 	agentv1.RegisterAgentServiceServer(srv, d112Srv)
 
 	go func() {
@@ -682,5 +690,295 @@ func TestAddAndGenerateTurn_ModelUnary(t *testing.T) {
 
 	if driver.promptCallCount != 0 {
 		t.Errorf("driver.Prompt should not be called, got %d calls", driver.promptCallCount)
+	}
+}
+
+func TestD112_Scratchpad_FullLifecycle(t *testing.T) {
+	tmpWs := t.TempDir()
+	agentDir := filepath.Join(tmpWs, "testagent")
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		t.Fatalf("mkdir agentDir: %v", err)
+	}
+
+	driver := &mockACPDriver{}
+	client, cleanup := setupTestServerWithFolder(driver, agentDir)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Create text scratchpad
+	createResp, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId:   "testagent",
+		Text:      "line 1\nline 2\nline 3\nline 4\nline 5\n",
+		CreatedBy: "test",
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad failed: %v", err)
+	}
+	entry1 := createResp.GetEntry()
+	if entry1.GetEntryId() == "" {
+		t.Fatalf("expected non-empty EntryId")
+	}
+	if entry1.GetLines() != 5 {
+		t.Errorf("expected 5 lines, got %d", entry1.GetLines())
+	}
+
+	// 2. GetScratchpad full
+	getResp, err := client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: "testagent",
+		EntryId: entry1.GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("GetScratchpad failed: %v", err)
+	}
+	if getResp.GetText() != "line 1\nline 2\nline 3\nline 4\nline 5\n" {
+		t.Errorf("unexpected text: %q", getResp.GetText())
+	}
+
+	// 3. GetScratchpad paginated (skip 1 line, take 2 lines)
+	skip := int32(1)
+	num := int32(2)
+	getPagedResp, err := client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId:   "testagent",
+		EntryId:   entry1.GetEntryId(),
+		SkipLines: &skip,
+		NumLines:  &num,
+	})
+	if err != nil {
+		t.Fatalf("GetScratchpad paginated failed: %v", err)
+	}
+	if getPagedResp.GetText() != "line 2\nline 3" {
+		t.Errorf("unexpected paginated text: %q", getPagedResp.GetText())
+	}
+
+	// 4. Create second entry with macro referencing entry1 (D90 macro expansion)
+	macroText := fmt.Sprintf("prefix\n<SCRATCHPAD_DATA id=\"%s\" skip_lines=\"1\" num_lines=\"1\" />\nsuffix\n", entry1.GetEntryId())
+	createMacroResp, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId: "testagent",
+		Text:    macroText,
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad with macro failed: %v", err)
+	}
+	entry2 := createMacroResp.GetEntry()
+	getMacroResp, err := client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: "testagent",
+		EntryId: entry2.GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("GetScratchpad macro entry failed: %v", err)
+	}
+	expectedMacroExpanded := "prefix\nline 2\nsuffix\n"
+	if getMacroResp.GetText() != expectedMacroExpanded {
+		t.Errorf("macro expansion failed, want %q got %q", expectedMacroExpanded, getMacroResp.GetText())
+	}
+
+	// 5. SearchScratchpad
+	searchResp, err := client.SearchScratchpad(ctx, &agentv1.SearchScratchpadRequest{
+		AgentId: "testagent",
+		EntryId: entry1.GetEntryId(),
+		Query:   "line 3",
+	})
+	if err != nil {
+		t.Fatalf("SearchScratchpad failed: %v", err)
+	}
+	if searchResp.GetTotalMatches() != 1 {
+		t.Errorf("expected 1 match, got %d", searchResp.GetTotalMatches())
+	}
+	if len(searchResp.GetMatches()) != 1 || searchResp.GetMatches()[0].GetLine() != 3 {
+		t.Errorf("unexpected match: %+v", searchResp.GetMatches())
+	}
+
+	// 6. ListScratchpads
+	listResp, err := client.ListScratchpads(ctx, &agentv1.ListScratchpadsRequest{
+		AgentId: "testagent",
+	})
+	if err != nil {
+		t.Fatalf("ListScratchpads failed: %v", err)
+	}
+	if listResp.GetTotalEntries() != 2 {
+		t.Errorf("expected 2 entries, got %d", listResp.GetTotalEntries())
+	}
+
+	// 7. DiffScratchpadEntries
+	diffResp, err := client.DiffScratchpadEntries(ctx, &agentv1.DiffScratchpadEntriesRequest{
+		AgentId:       "testagent",
+		BeforeEntryId: entry1.GetEntryId(),
+		AfterEntryId:  entry2.GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("DiffScratchpadEntries failed: %v", err)
+	}
+	if diffResp.GetDiff() == "" {
+		t.Errorf("expected non-empty diff")
+	}
+
+	// 8. CreateBinaryScratchpad and ensure GetScratchpad rejects it
+	binData := []byte{0x00, 0x01, 0x02, 0x03, 'P', 'N', 'G'}
+	createBinResp, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId:  "testagent",
+		Data:     binData,
+		MimeType: "application/octet-stream",
+	})
+	if err != nil {
+		t.Fatalf("CreateBinaryScratchpad failed: %v", err)
+	}
+	binEntry := createBinResp.GetEntry()
+	if !binEntry.GetIsBinary() {
+		t.Errorf("expected IsBinary=true")
+	}
+	_, err = client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: "testagent",
+		EntryId: binEntry.GetEntryId(),
+	})
+	if err == nil {
+		t.Errorf("expected GetScratchpad to reject binary entry, got nil error")
+	}
+
+	// 9. DeleteScratchpad
+	_, err = client.DeleteScratchpad(ctx, &agentv1.DeleteScratchpadRequest{
+		AgentId: "testagent",
+		EntryId: entry1.GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("DeleteScratchpad failed: %v", err)
+	}
+	// Verify deletion
+	_, err = client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: "testagent",
+		EntryId: entry1.GetEntryId(),
+	})
+	if err == nil {
+		t.Errorf("expected GetScratchpad to fail on deleted entry, got nil error")
+	}
+}
+
+func TestD112_Scratchpad_CrossAgent(t *testing.T) {
+	tmpWs := t.TempDir()
+	agentA := filepath.Join(tmpWs, "agentA")
+	agentB := filepath.Join(tmpWs, "agentB")
+	agentC := filepath.Join(tmpWs, "agentC")
+	_ = os.MkdirAll(agentA, 0755)
+	_ = os.MkdirAll(agentB, 0755)
+	_ = os.MkdirAll(agentC, 0755)
+
+	driver := &mockACPDriver{}
+	// Server is wired for agentA
+	client, cleanup := setupTestServerWithFolder(driver, agentA)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Same-agent access always allowed without allowlist
+	_, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId: "agentA",
+		Text:    "own deposit",
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad for same agent failed: %v", err)
+	}
+
+	// 2. Cross-agent access without allowlist must be DENIED (codes.PermissionDenied)
+	_, err = client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId: "agentB",
+		Text:    "unauthorized deposit",
+	})
+	if err == nil {
+		t.Fatalf("expected CreateScratchpad for agentB to fail with no allowlist, got nil")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("expected PermissionDenied for agentB with no allowlist, got: %v (code: %v)", err, status.Code(err))
+	}
+
+	_, err = client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: "agentB",
+		EntryId: "1234",
+	})
+	if err == nil {
+		t.Fatalf("expected GetScratchpad for agentB to fail with no allowlist, got nil")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("expected PermissionDenied for GetScratchpad, got: %v", err)
+	}
+
+	_, err = client.ListScratchpads(ctx, &agentv1.ListScratchpadsRequest{
+		AgentId: "agentB",
+	})
+	if err == nil {
+		t.Fatalf("expected ListScratchpads for agentB to fail with no allowlist, got nil")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("expected PermissionDenied for ListScratchpads, got: %v", err)
+	}
+
+	// 3. Add allowlist to calling agent folder (agentA) allowing only agentB
+	allowlistPath := filepath.Join(agentA, agent.AllowedAgentsFile)
+	if err := os.WriteFile(allowlistPath, []byte("# allowlist\nagentB\n"), 0644); err != nil {
+		t.Fatalf("failed to write %s: %v", agent.AllowedAgentsFile, err)
+	}
+
+	// 4. Cross-agent access to allowlisted target agentB must PASS
+	createResp, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId: "agentB",
+		Text:    "deposit from agentB",
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad for allowlisted agentB failed: %v", err)
+	}
+
+	getResp, err := client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: "agentB",
+		EntryId: createResp.GetEntry().GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("GetScratchpad for allowlisted agentB failed: %v", err)
+	}
+	if getResp.GetText() != "deposit from agentB" {
+		t.Errorf("expected 'deposit from agentB', got %q", getResp.GetText())
+	}
+
+	// 5. Cross-agent DiffScratchpadEntries for allowlisted agentB must PASS
+	createResp2, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId: "agentB",
+		Text:    "deposit 2 from agentB",
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad 2 for allowlisted agentB failed: %v", err)
+	}
+
+	diffResp, err := client.DiffScratchpadEntries(ctx, &agentv1.DiffScratchpadEntriesRequest{
+		AgentId:       "agentB",
+		BeforeEntryId: createResp.GetEntry().GetEntryId(),
+		AfterEntryId:  createResp2.GetEntry().GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("DiffScratchpadEntries for allowlisted agentB failed: %v", err)
+	}
+	if diffResp.GetDiff() == "" {
+		t.Errorf("expected non-empty diff, got empty")
+	}
+
+	// 6. Cross-agent access to non-allowlisted target agentC must be DENIED
+	_, err = client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId: "agentC",
+		Text:    "unauthorized deposit to agentC",
+	})
+	if err == nil {
+		t.Fatalf("expected CreateScratchpad for non-allowlisted agentC to fail, got nil")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("expected PermissionDenied for non-allowlisted agentC, got: %v (code: %v)", err, status.Code(err))
+	}
+
+	_, err = client.DiffScratchpadEntries(ctx, &agentv1.DiffScratchpadEntriesRequest{
+		AgentId:       "agentC",
+		BeforeEntryId: "1234",
+		AfterEntryId:  "5678",
+	})
+	if err == nil {
+		t.Fatalf("expected DiffScratchpadEntries for non-allowlisted agentC to fail, got nil")
+	}
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("expected PermissionDenied for non-allowlisted agentC diff, got: %v (code: %v)", err, status.Code(err))
 	}
 }

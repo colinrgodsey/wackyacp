@@ -945,6 +945,110 @@ func TestE2E_ModelSlashCommand(t *testing.T) {
 	}
 }
 
+func TestBridge_Scratchpad_RoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	agentFolder := newTestAgentFolder(t)
+	client, cleanup := spawnBridge(t, ctx, agentFolder, "normal")
+	defer cleanup()
+
+	agentID := filepath.Base(agentFolder)
+
+	// 1. Create text entry
+	createResp, err := client.CreateScratchpad(ctx, &agentv1.CreateScratchpadRequest{
+		AgentId:   agentID,
+		Text:      "Alpha\nBeta\nGamma\nDelta\n",
+		CreatedBy: "tester",
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad failed: %v", err)
+	}
+	entry := createResp.GetEntry()
+	if entry == nil || entry.GetEntryId() == "" {
+		t.Fatalf("expected valid entry returned, got %+v", entry)
+	}
+	if entry.GetLines() != 4 {
+		t.Errorf("expected 4 lines, got %d", entry.GetLines())
+	}
+
+	// Verify file was written to <agentFolder>/scratchpad/
+	spFiles, err := filepath.Glob(filepath.Join(agentFolder, "scratchpad", entry.GetEntryId()+"-*"))
+	if err != nil || len(spFiles) == 0 {
+		t.Fatalf("expected scratchpad file on disk for %s, got err=%v matches=%v", entry.GetEntryId(), err, spFiles)
+	}
+
+	// 2. Read full entry
+	getResp, err := client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: agentID,
+		EntryId: entry.GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("GetScratchpad failed: %v", err)
+	}
+	if getResp.GetText() != "Alpha\nBeta\nGamma\nDelta\n" {
+		t.Errorf("unexpected content: %q", getResp.GetText())
+	}
+
+	// 3. Read paginated (skip 1 line, num 2 lines)
+	skip := int32(1)
+	num := int32(2)
+	getPagedResp, err := client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId:   agentID,
+		EntryId:   entry.GetEntryId(),
+		SkipLines: &skip,
+		NumLines:  &num,
+	})
+	if err != nil {
+		t.Fatalf("GetScratchpad paginated failed: %v", err)
+	}
+	if getPagedResp.GetText() != "Beta\nGamma" {
+		t.Errorf("unexpected paginated content: %q", getPagedResp.GetText())
+	}
+
+	// 4. Search
+	searchResp, err := client.SearchScratchpad(ctx, &agentv1.SearchScratchpadRequest{
+		AgentId: agentID,
+		EntryId: entry.GetEntryId(),
+		Query:   "Gamma",
+	})
+	if err != nil {
+		t.Fatalf("SearchScratchpad failed: %v", err)
+	}
+	if searchResp.GetTotalMatches() != 1 {
+		t.Errorf("expected 1 match, got %d", searchResp.GetTotalMatches())
+	}
+
+	// 5. List
+	listResp, err := client.ListScratchpads(ctx, &agentv1.ListScratchpadsRequest{
+		AgentId: agentID,
+	})
+	if err != nil {
+		t.Fatalf("ListScratchpads failed: %v", err)
+	}
+	if listResp.GetTotalEntries() != 1 {
+		t.Errorf("expected 1 entry, got %d", listResp.GetTotalEntries())
+	}
+
+	// 6. Delete
+	_, err = client.DeleteScratchpad(ctx, &agentv1.DeleteScratchpadRequest{
+		AgentId: agentID,
+		EntryId: entry.GetEntryId(),
+	})
+	if err != nil {
+		t.Fatalf("DeleteScratchpad failed: %v", err)
+	}
+
+	// Verify deleted
+	_, err = client.GetScratchpad(ctx, &agentv1.GetScratchpadRequest{
+		AgentId: agentID,
+		EntryId: entry.GetEntryId(),
+	})
+	if err == nil {
+		t.Errorf("expected GetScratchpad to fail on deleted entry, got nil error")
+	}
+}
+
 func TestZZZ_Canary_NoOrphanProcesses(t *testing.T) {
 	// Assert no stray wackyacp or harness processes tagged with e2eMarker remain after the suite
 	strays, err := sweepProcesses(e2eMarker)
