@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/colinrgodsey/wackyacp/internal/claudesdk"
 	"github.com/colinrgodsey/wackyacp/internal/d112"
+	"github.com/colinrgodsey/wackyacp/internal/harness"
 	"github.com/colinrgodsey/wackyacp/internal/session"
 )
 
@@ -27,6 +29,10 @@ type sdkDirectOptions struct {
 	sdkDir           string
 	nodeBin          string
 	additionalDirs   string
+	// claudeDir overrides which Claude configuration directory the
+	// stale OAuth lock probe inspects. Empty resolves the same way the ACP
+	// path resolves it.
+	claudeDir string
 }
 
 // runSDKDirect serves the same D112 gRPC surface as the ACP path, backed by the
@@ -62,8 +68,14 @@ func runSDKDirect(o sdkDirectOptions) error {
 		savedID = saved.SessionID
 	}
 
+	// OAuth refresh lock parity with the ACP path, where harness.Start reclaims
+	// a lock a dead claude died holding before spawning anything. The SDK worker
+	// leaves claude children that can die holding the very same lock.
+	recoverOAuthRefreshLock(o.agentFolder, o.claudeDir, os.Stderr)
+
 	drv, err := claudesdk.New(claudesdk.Config{
 		AgentFolder:           o.agentFolder,
+		BridgeCtx:             ctx,
 		SystemPromptMode:      mode,
 		SessionID:             savedID,
 		NodeBin:               o.nodeBin,
@@ -108,4 +120,28 @@ func splitDirs(raw string) []string {
 		}
 	}
 	return out
+}
+
+// sdkRuntimeDescriptor names the runtime SDK-direct mode drives. Claude Code is
+// the process that owns .oauth_refresh.lock, and passing it as the harness
+// descriptor keeps lock-directory resolution shared with the ACP path instead of
+// reimplementing that decision here.
+const sdkRuntimeDescriptor = "claude"
+
+// recoverOAuthRefreshLock reclaims a stale Claude OAuth refresh lock left behind
+// by a claude process that died mid-refresh. An empty claudeDir keeps the same
+// candidate set the ACP path probes: CLAUDE_CONFIG_DIR, the user's ~/.claude, and
+// the agent folder's own .claude when it exists.
+func recoverOAuthRefreshLock(agentFolder, claudeDir string, stderr io.Writer) {
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	if _, err := harness.RecoverStaleOAuthLock(harness.Config{
+		Command:     sdkRuntimeDescriptor,
+		AgentFolder: agentFolder,
+		ClaudeDir:   claudeDir,
+		Stderr:      stderr,
+	}); err != nil {
+		fmt.Fprintln(stderr, "wackyacp: warning: checking oauth refresh lock:", err)
+	}
 }

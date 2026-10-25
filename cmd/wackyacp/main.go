@@ -26,6 +26,7 @@ func run() error {
 	claudeSDKDir := flag.String("claude-sdk-dir", "", "claude-sdk only: directory containing @anthropic-ai/claude-agent-sdk (default: the pinned install)")
 	nodeBin := flag.String("node-bin", "node", "claude-sdk only: node executable that runs the SDK worker")
 	additionalDirs := flag.String("additional-directories", "", "claude-sdk only: comma-separated directories the SDK may work in outside the agent folder, replacing per-edit permission prompts")
+	claudeDir := flag.String("claude-dir", "", "claude-sdk only: Claude configuration directory to probe for a stale OAuth refresh lock (default: resolve as the ACP path does)")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: wackyacp [flags] (bridge dispatch mode)")
@@ -55,6 +56,7 @@ func run() error {
 			sdkDir:           *claudeSDKDir,
 			nodeBin:          *nodeBin,
 			additionalDirs:   *additionalDirs,
+			claudeDir:        *claudeDir,
 		})
 	}
 	if *driver != driverACP {
