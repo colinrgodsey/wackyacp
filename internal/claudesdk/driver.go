@@ -119,13 +119,14 @@ func New(cfg Config) (*Driver, error) {
 		cfg.BridgeCtx = context.Background()
 	}
 	return &Driver{
-		cfg:       cfg,
-		persisted: cfg.SessionID != "",
-		pending:   make(map[int64]chan *workerEvent),
-		callbacks: make(map[int64]*acp.TurnCallbacks),
-		ready:     make(chan struct{}),
-		gone:      make(chan struct{}),
-		sessionID: cfg.SessionID,
+		cfg:           cfg,
+		persisted:     cfg.SessionID != "",
+		pending:       make(map[int64]chan *workerEvent),
+		callbacks:     make(map[int64]*acp.TurnCallbacks),
+		ready:         make(chan struct{}),
+		gone:          make(chan struct{}),
+		sessionID:     cfg.SessionID,
+		prevPromptSHA: readPromptSHA(cfg.AgentFolder),
 	}, nil
 }
 
@@ -502,7 +503,11 @@ func (d *Driver) Prompt(ctx context.Context, sessionID, promptText string, callb
 		// Claude's own housekeeping can delete or truncate the transcript behind
 		// a persisted id. Starting over is recoverable, so retry once rather than
 		// failing the caller's turn.
-		fmt.Fprintf(os.Stderr, "wackyacp claudesdk: cannot resume session %s, starting fresh\n", sid)
+		warning := "session context lost: cannot resume claude session " + sid + ", continuing this turn in a fresh session"
+		fmt.Fprintln(os.Stderr, "wackyacp claudesdk:", warning)
+		if callbacks.OnWarning != nil {
+			_ = callbacks.OnWarning(warning)
+		}
 		result, err = d.runTurn(ctx, sid, false, promptText, composed, skills.Names, callbacks)
 	}
 	if err != nil {
@@ -512,6 +517,7 @@ func (d *Driver) Prompt(ctx context.Context, sessionID, promptText string, callb
 	d.mu.Lock()
 	d.hasSession = true
 	d.prevPromptSHA = composed.SHA256
+	writePromptSHA(d.cfg.AgentFolder, composed.SHA256)
 	notify := d.cfg.OnSessionEstablished
 	established := d.sessionID
 	d.mu.Unlock()

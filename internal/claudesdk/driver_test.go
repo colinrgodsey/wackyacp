@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -360,4 +361,75 @@ func processExists(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// TestDriverReportsLostSessionContext proves the fresh-session retry is visible
+// to the caller. Silently dropping conversation context is the failure mode a
+// reviewer cannot see in a green turn record.
+func TestDriverReportsLostSessionContext(t *testing.T) {
+	d := newTestDriver(t, "resume-fail", "persisted-session-id")
+
+	var warnings []string
+	cbs := acp.TurnCallbacks{OnWarning: func(w string) error { warnings = append(warnings, w); return nil }}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := d.Prompt(ctx, "persisted-session-id", "hi", cbs); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "session context lost") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an OnWarning about lost session context, got %v", warnings)
+	}
+}
+
+// TestPromptDigestSurvivesDriverRestart pins the prompt-cache discipline: the
+// first turn of a bridge has nothing cached, later turns must snapshot, and a
+// restarted bridge must remember the digest instead of forcing a miss.
+func TestPromptDigestSurvivesDriverRestart(t *testing.T) {
+	agentDir := filepath.Join(t.TempDir(), "claude")
+	writeFile(t, filepath.Join(agentDir, "AGENTS.md"), "test agent"+nl)
+
+	newDriver := func() *Driver {
+		rec := &spawnRecorder{scenario: "multi"}
+		d, err := New(Config{AgentFolder: agentDir, Spawn: rec.spawn})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() { _ = d.Close() })
+		return d
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	first := newDriver()
+	res, err := first.Prompt(ctx, "", "one", acp.TurnCallbacks{})
+	if err != nil {
+		t.Fatalf("first bridge turn 1: %v", err)
+	}
+	if res.StopReason != "snapshot=false" {
+		t.Errorf("turn 1 sent %q, want snapshot=false because nothing is cached yet", res.StopReason)
+	}
+	res, err = first.Prompt(ctx, "", "two", acp.TurnCallbacks{})
+	if err != nil {
+		t.Fatalf("first bridge turn 2: %v", err)
+	}
+	if res.StopReason != "snapshot=true" {
+		t.Errorf("turn 2 sent %q, want snapshot=true because the prompt is unchanged", res.StopReason)
+	}
+
+	second := newDriver()
+	res, err = second.Prompt(ctx, "", "three", acp.TurnCallbacks{})
+	if err != nil {
+		t.Fatalf("restarted bridge turn: %v", err)
+	}
+	if res.StopReason != "snapshot=true" {
+		t.Errorf("a restarted bridge sent %q: it lost the prompt digest and forced a cache miss", res.StopReason)
+	}
 }
