@@ -54,6 +54,9 @@ type Config struct {
 	// replacing the per-edit permission prompts the ACP adapter generated.
 	AdditionalDirectories []string
 	PermissionMode        string
+	// OnSessionEstablished fires with the session id after the first successful
+	// turn, so the bridge can persist an id it created itself.
+	OnSessionEstablished func(sessionID string)
 	// Spawn overrides worker creation. Tests inject a canned worker so the frame
 	// protocol runs without node installed.
 	Spawn func(ctx context.Context) (*exec.Cmd, error)
@@ -217,7 +220,14 @@ func (d *Driver) startWorker(ctx context.Context) error {
 		return fmt.Errorf("claudesdk: worker stdout: %w", err)
 	}
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), sdkDirEnvVar+"="+d.cfg.SDKDir)
+	// Append rather than replace: an injected Spawn may already have set
+	// its own environment, and a nil cmd.Env means the child should keep the
+	// inherited one rather than boot with nothing.
+	base := cmd.Env
+	if base == nil {
+		base = os.Environ()
+	}
+	cmd.Env = append(base, sdkDirEnvVar+"="+d.cfg.SDKDir)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("claudesdk: starting worker: %w", err)
@@ -422,7 +432,12 @@ func (d *Driver) Prompt(ctx context.Context, sessionID, promptText string, callb
 	d.mu.Lock()
 	d.hasSession = true
 	d.prevPromptSHA = composed.SHA256
+	notify := d.cfg.OnSessionEstablished
+	established := d.sessionID
 	d.mu.Unlock()
+	if notify != nil {
+		notify(established)
+	}
 	return result, nil
 }
 
