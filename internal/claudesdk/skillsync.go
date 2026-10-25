@@ -89,6 +89,10 @@ func SyncOnDemandSkills(agentFolder string) (*SkillSyncResult, error) {
 			res.Warnings = append(res.Warnings, fmt.Sprintf("skill %s: cannot resolve %s: %v", sk.Name, sk.Path, err))
 			continue
 		}
+		// The name is reserved even when its link slot turns out to be occupied by
+		// something we did not create: the manifest records only names wackyacp
+		// might have linked, and pruning additionally requires the path to be a
+		// symlink, so an unlinked collision can never be deleted here.
 		keep[sk.Name] = true
 		res.Names = append(res.Names, sk.Name)
 		res.Dirs[sk.Name] = src

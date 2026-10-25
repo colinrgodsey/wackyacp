@@ -116,3 +116,46 @@ func TestSyncOnDemandSkillsReportsCollisionWithRealDirectory(t *testing.T) {
 		t.Errorf("collision handling destroyed existing content: %v", err)
 	}
 }
+
+func TestSyncOnDemandSkillsReplacesStaleManagedLinkWithoutTouchingOldTarget(t *testing.T) {
+	agentDir := filepath.Join(t.TempDir(), "claude")
+
+	// A skill used to live here and an earlier managed sync linked to it.
+	oldTarget := t.TempDir()
+	writeFile(t, filepath.Join(oldTarget, "SKILL.md"), "old body"+nl)
+	link := filepath.Join(agentDir, ".claude", "skills", "s1")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatalf("mkdir for link: %v", err)
+	}
+	if err := os.Symlink(oldTarget, link); err != nil {
+		t.Fatalf("seeding link: %v", err)
+	}
+	writeFile(t, filepath.Join(agentDir, ".claude", "skills", manifestFileName), `{"links":["s1"]}`+nl)
+
+	// The skill now lives inside the agent folder instead.
+	skillFixture(t, agentDir, "s1", false)
+
+	res, err := SyncOnDemandSkills(agentDir)
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("link missing after sync: %v", err)
+	}
+	if target == oldTarget {
+		t.Errorf("link still points at the stale location %q", target)
+	}
+	if !strings.HasSuffix(target, filepath.Join("skills", "s1")) {
+		t.Errorf("link target = %q, want the skill directory inside the agent folder", target)
+	}
+	if len(res.Linked) != 1 || res.Linked[0] != "s1" {
+		t.Errorf("linked = %v, want [s1]", res.Linked)
+	}
+	// Replacing the link must not follow it: the old directory's contents belong
+	// to whoever made them, and deleting through a symlink is how a sync would
+	// stop being safe.
+	if _, err := os.Stat(filepath.Join(oldTarget, "SKILL.md")); err != nil {
+		t.Errorf("replacing the link destroyed the previous target directory: %v", err)
+	}
+}
