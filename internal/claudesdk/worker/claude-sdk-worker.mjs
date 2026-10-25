@@ -5,10 +5,15 @@
 // locks); this worker owns the Claude Agent SDK call. One request frame per
 // turn on stdin, event frames back out on stdout. Nothing here talks to disk
 // except through the scratchpad tools, which round-trip to Go so there is
-// exactly one implementation of entry IDs and size limits.
+// exactly one implementation of entry IDs and size limits, and one read-only
+// probe of the Claude transcript directory used to tell "resume is impossible"
+// apart from "the turn failed".
 
+import { existsSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
 
 const sdkDir = process.env.WACKYACP_CLAUDE_SDK_DIR
   || '/home/dranbo/node_modules/.pnpm/node_modules/@anthropic-ai/claude-agent-sdk';
@@ -35,7 +40,8 @@ const pendingTool = new Map();
 let toolReqSeq = 0;
 
 // askGo forwards one scratchpad tool call to the Go driver and waits for its
-// answer. Scratchpad truth lives in wackypub, so the worker never reads files.
+// answer. Scratchpad truth lives in wackypub, so the worker never reads files
+// for it.
 function askGo(name, args) {
   const requestId = ++toolReqSeq;
   return new Promise((resolve, reject) => {
@@ -49,8 +55,8 @@ function textResult(text) {
 }
 
 // scratchpadServer builds the in-process MCP server exposing wackypub
-// scratchpads as native tools. If zod cannot be resolved the worker still
-// runs; claude simply has no scratchpad tools and gets told so once per turn.
+// scratchpads as native tools. If zod cannot be resolved the worker still runs;
+// claude simply has no scratchpad tools and gets told so once per turn.
 function scratchpadServer() {
   let z;
   try {
@@ -112,10 +118,23 @@ function summarize(input) {
   }
 }
 
+// stopReasonFrom maps an SDK result to a turn stop reason. Returning null means
+// "this result is a failure", which must be reported as an error rather than
+// recorded as a stop reason: an API failure logged as a refusal is worse than no
+// log at all, because it looks like the model declined.
 function stopReasonFrom(msg) {
+  if (msg.is_error) return null;
   if (msg.subtype === 'success') return 'end_turn';
   if (msg.subtype === 'error_max_turns') return 'max_turns';
-  return 'refusal';
+  return null;
+}
+
+function describeFailure(msg) {
+  if (Array.isArray(msg.errors) && msg.errors.length) {
+    return msg.errors.map((e) => summarize(e)).join('; ');
+  }
+  if (msg.error) return summarize(msg.error);
+  return 'no error detail in result';
 }
 
 function usageFrom(msg) {
@@ -129,8 +148,53 @@ function usageFrom(msg) {
   };
 }
 
+function claudeConfigDir() {
+  return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+}
+
+// transcriptExists reports whether the JSONL behind a session id is on disk.
+// Returns null when the probe itself is inconclusive, so an unreadable projects
+// directory never gets mistaken for "the transcript is gone".
+function transcriptExists(sessionId) {
+  if (!sessionId) return null;
+  const projects = join(claudeConfigDir(), 'projects');
+  let slugs;
+  try {
+    slugs = readdirSync(projects);
+  } catch {
+    return null;
+  }
+  for (const slug of slugs) {
+    try {
+      if (existsSync(join(projects, slug, sessionId + '.jsonl'))) return true;
+    } catch {
+      return null;
+    }
+  }
+  return false;
+}
+
+// An auth or transport failure must never be read as "the transcript is gone",
+// because the cure for a missing transcript is starting a new session, which
+// silently discards the conversation.
+const AUTH_ERROR = /oauth|api[-_ ]?key|401|403|unauthor|forbidden|invalid[-_ ]?(token|key|credential)|rate[-_ ]?limit|etimedout|enotfound|econn/i;
+const TRANSCRIPT_ERROR = /no such file|enoent|transcript|resume|session (file|id|not|does)|does not exist|corrupt|unparsable|unreadable/i;
+
 async function runPrompt(req) {
   const spec = req.systemPrompt || {};
+
+  if (req.resume) {
+    const present = transcriptExists(req.sessionId);
+    if (present === false) {
+      out({
+        type: 'event', id: req.id, kind: 'warning',
+        text: 'session transcript for ' + req.sessionId + ' is not on disk; this turn will continue in a fresh session',
+      });
+      fail(req.id, 'resume_failed', 'transcript not found for session ' + req.sessionId);
+      return;
+    }
+  }
+
   const options = {
     cwd: req.cwd,
     additionalDirectories: req.additionalDirectories || [],
@@ -197,13 +261,18 @@ async function runPrompt(req) {
       fail(req.id, 'turn_failed', 'SDK stream ended without a result message');
       return;
     }
+    const stopReason = stopReasonFrom(resultMsg);
+    if (!stopReason) {
+      fail(req.id, 'turn_failed', 'SDK reported ' + resultMsg.subtype + ': ' + describeFailure(resultMsg));
+      return;
+    }
     out({
       type: 'result', id: req.id, sessionId,
-      stopReason: stopReasonFrom(resultMsg), usage: usageFrom(resultMsg),
+      stopReason, usage: usageFrom(resultMsg),
     });
   } catch (err) {
     const message = String((err && err.message) || err);
-    if (req.resume && /resume|session|transcript/i.test(message)) {
+    if (req.resume && !AUTH_ERROR.test(message) && TRANSCRIPT_ERROR.test(message)) {
       fail(req.id, 'resume_failed', message);
     } else {
       fail(req.id, 'turn_failed', message);
@@ -215,36 +284,33 @@ async function runPrompt(req) {
 
 out({ type: 'ready', sdk: sdkDir, scratchpadTools: Boolean(scratchpad.server) });
 
-const readline = require_readline();
-async function require_readline() {
-  const { createInterface } = await import('node:readline');
-  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  rl.on('line', (line) => {
-    if (!line.trim()) return;
-    let frame;
-    try {
-      frame = JSON.parse(line);
-    } catch (err) {
-      out({ type: 'error', code: 'bad_frame', message: 'worker cannot parse request: ' + err.message });
-      return;
+const { createInterface } = await import('node:readline');
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  let frame;
+  try {
+    frame = JSON.parse(line);
+  } catch (err) {
+    out({ type: 'error', code: 'bad_frame', message: 'worker cannot parse request: ' + err.message });
+    return;
+  }
+  if (frame.type === 'tool_response') {
+    const waiter = pendingTool.get(frame.requestId);
+    if (waiter) {
+      pendingTool.delete(frame.requestId);
+      if (frame.ok) waiter.resolve(frame.text); else waiter.reject(new Error(frame.error || 'tool call failed'));
     }
-    if (frame.type === 'tool_response') {
-      const waiter = pendingTool.get(frame.requestId);
-      if (waiter) {
-        pendingTool.delete(frame.requestId);
-        if (frame.ok) waiter.resolve(frame.text); else waiter.reject(new Error(frame.error || 'tool call failed'));
-      }
-      return;
-    }
-    if (frame.op === 'cancel') {
-      if (active && typeof active.interrupt === 'function') active.interrupt();
-      return;
-    }
-    if (frame.op === 'prompt') {
-      runPrompt(frame);
-      return;
-    }
-    out({ type: 'error', id: frame.id, code: 'bad_op', message: 'unknown worker op ' + frame.op });
-  });
-  rl.on('close', () => process.exit(0));
-}
+    return;
+  }
+  if (frame.op === 'cancel') {
+    if (active && typeof active.interrupt === 'function') active.interrupt();
+    return;
+  }
+  if (frame.op === 'prompt') {
+    runPrompt(frame);
+    return;
+  }
+  out({ type: 'error', id: frame.id, code: 'bad_op', message: 'unknown worker op ' + frame.op });
+});
+rl.on('close', () => process.exit(0));
