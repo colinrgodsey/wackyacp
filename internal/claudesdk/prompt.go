@@ -55,6 +55,7 @@ Your wackypub agent folder has a persistent scratchpad for large outputs, resear
 2. Inspect before reading whole entries: list_scratchpads, then search_scratchpad, then get_scratchpad with a line window, then diff_scratchpad to compare two versions.
 3. Hand off large artifacts to another agent by ID, not by pasting body text: deposit the payload with create_scratchpad, then reference it in the message you send to the other agent.
 4. Keep one entry per artifact and create a new entry rather than rewriting a good one, so a diff can show what moved.
+These tools are served by wackypub, so your client may show them namespaced, for example mcp__wackypub__get_scratchpad.
 </WACKYPUB_SCRATCHPAD_PROTOCOL>`
 
 // ComposedPrompt is the rendered system prompt plus the digest that drives the
