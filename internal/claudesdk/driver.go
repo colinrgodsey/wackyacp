@@ -59,7 +59,12 @@ type Config struct {
 	OnSessionEstablished func(sessionID string)
 	// Spawn overrides worker creation. Tests inject a canned worker so the frame
 	// protocol runs without node installed.
-	Spawn func(ctx context.Context) (*exec.Cmd, error)
+	// BridgeCtx bounds the worker process for the life of the bridge. It must
+	// outlive any single turn, because D112 hands Prompt the gRPC stream context
+	// and that context ends when the turn does. Nil means context.Background(),
+	// which leaves Close as the only shutdown path.
+	BridgeCtx context.Context
+	Spawn     func(ctx context.Context) (*exec.Cmd, error)
 }
 
 // Driver implements d112.ACPDriver against the Claude Agent SDK. One driver
@@ -68,15 +73,18 @@ type Driver struct {
 	cfg       Config
 	persisted bool
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	enc       *json.Encoder
-	pending   map[int64]chan *workerEvent
-	callbacks map[int64]*acp.TurnCallbacks
-	ready     chan struct{}
-	readyErr  error
-	gone      chan struct{}
+	mu         sync.Mutex
+	spawnMu    sync.Mutex
+	cmd        *exec.Cmd
+	workerCtx  context.Context
+	generation int64
+	stdin      io.WriteCloser
+	enc        *json.Encoder
+	pending    map[int64]chan *workerEvent
+	callbacks  map[int64]*acp.TurnCallbacks
+	ready      chan struct{}
+	readyErr   error
+	gone       chan struct{}
 
 	idCounter atomic.Int64
 
@@ -106,6 +114,9 @@ func New(cfg Config) (*Driver, error) {
 	}
 	if cfg.SystemPromptMode == "" {
 		cfg.SystemPromptMode = ModeAppend
+	}
+	if cfg.BridgeCtx == nil {
+		cfg.BridgeCtx = context.Background()
 	}
 	return &Driver{
 		cfg:       cfg,
@@ -162,27 +173,57 @@ func (d *Driver) workerPath() (string, error) {
 
 // ensureWorker starts the worker once and waits for its ready frame.
 func (d *Driver) ensureWorker(ctx context.Context) error {
+	d.spawnMu.Lock()
+	defer d.spawnMu.Unlock()
+
 	d.mu.Lock()
 	starting := d.cmd == nil
+	ready, gone := d.ready, d.gone
 	d.mu.Unlock()
+
 	if starting {
-		if err := d.startWorker(ctx); err != nil {
+		if err := d.startWorker(); err != nil {
 			return err
 		}
+		// Re-read: the spawn installed this worker's own handshake channels.
+		d.mu.Lock()
+		ready, gone = d.ready, d.gone
+		d.mu.Unlock()
 	}
+
 	select {
-	case <-d.readySignal():
+	case <-ready:
 		d.mu.Lock()
 		err := d.readyErr
 		d.mu.Unlock()
 		return err
-	case <-d.goneSignal():
+	case <-gone:
 		return errors.New("claudesdk: worker exited before becoming ready")
 	case <-time.After(readyTimeout):
 		return fmt.Errorf("claudesdk: worker did not report ready within %s", readyTimeout)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// workerPID reports the process id of the current worker, or 0 when there is
+// none. Lifecycle tests use it to assert one worker serves many turns.
+func (d *Driver) workerPID() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.cmd == nil || d.cmd.Process == nil {
+		return 0
+	}
+	return d.cmd.Process.Pid
+}
+
+// spawnedWorkerContext returns the context the current worker was created
+// with. It must be the bridge lifetime context: a worker bound to a turn
+// context is killed the moment that turn's RPC completes.
+func (d *Driver) spawnedWorkerContext() context.Context {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.workerCtx
 }
 
 func (d *Driver) readySignal() chan struct{} {
@@ -197,32 +238,49 @@ func (d *Driver) goneSignal() chan struct{} {
 	return d.gone
 }
 
-func (d *Driver) startWorker(ctx context.Context) error {
+func (d *Driver) startWorker() error {
+	d.mu.Lock()
+	d.generation++
+	gen := d.generation
+	d.ready = make(chan struct{})
+	d.gone = make(chan struct{})
+	d.readyErr = nil
+	d.mu.Unlock()
+
+	life := d.cfg.BridgeCtx
 	var cmd *exec.Cmd
 	if d.cfg.Spawn != nil {
-		var err error
-		if cmd, err = d.cfg.Spawn(ctx); err != nil {
-			return fmt.Errorf("claudesdk: spawn: %w", err)
+		spawned, err := d.cfg.Spawn(life)
+		if err != nil {
+			wrapped := fmt.Errorf("claudesdk: spawn: %w", err)
+			d.failStart(gen, wrapped)
+			return wrapped
 		}
+		cmd = spawned
 	} else {
 		path, err := d.workerPath()
 		if err != nil {
+			d.failStart(gen, err)
 			return err
 		}
-		cmd = exec.CommandContext(ctx, d.cfg.NodeBin, path)
+		cmd = exec.CommandContext(life, d.cfg.NodeBin, path)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("claudesdk: worker stdin: %w", err)
+		wrapped := fmt.Errorf("claudesdk: worker stdin: %w", err)
+		d.failStart(gen, wrapped)
+		return wrapped
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("claudesdk: worker stdout: %w", err)
+		wrapped := fmt.Errorf("claudesdk: worker stdout: %w", err)
+		d.failStart(gen, wrapped)
+		return wrapped
 	}
 	cmd.Stderr = os.Stderr
-	// Append rather than replace: an injected Spawn may already have set
-	// its own environment, and a nil cmd.Env means the child should keep the
-	// inherited one rather than boot with nothing.
+	// Append rather than replace: an injected Spawn may already have set its own
+	// environment, and a nil cmd.Env means the child should keep the inherited
+	// one rather than boot with nothing.
 	base := cmd.Env
 	if base == nil {
 		base = os.Environ()
@@ -230,22 +288,44 @@ func (d *Driver) startWorker(ctx context.Context) error {
 	cmd.Env = append(base, sdkDirEnvVar+"="+d.cfg.SDKDir)
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("claudesdk: starting worker: %w", err)
+		wrapped := fmt.Errorf("claudesdk: starting worker: %w", err)
+		d.failStart(gen, wrapped)
+		return wrapped
 	}
 
 	d.mu.Lock()
 	d.cmd = cmd
+	d.workerCtx = life
 	d.stdin = stdin
 	d.enc = json.NewEncoder(stdin)
 	d.mu.Unlock()
 
-	go d.readLoop(stdout, cmd)
+	go d.readLoop(stdout, cmd, gen)
 	return nil
+}
+
+// failStart retires a worker that never came up, so the next turn retries from
+// scratch and anyone waiting on this generation learns why instead of blocking
+// until the ready timeout.
+func (d *Driver) failStart(gen int64, reason error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if gen != d.generation {
+		return
+	}
+	d.cmd = nil
+	d.stdin = nil
+	d.enc = nil
+	d.workerCtx = nil
+	if reason != nil && !isClosed(d.ready) {
+		d.readyErr = reason
+		close(d.ready)
+	}
 }
 
 // readLoop demultiplexes worker frames. One goroutine per worker; it returns
 // when the worker closes stdout.
-func (d *Driver) readLoop(stdout io.Reader, cmd *exec.Cmd) {
+func (d *Driver) readLoop(stdout io.Reader, cmd *exec.Cmd, gen int64) {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
@@ -264,7 +344,7 @@ func (d *Driver) readLoop(stdout io.Reader, cmd *exec.Cmd) {
 		fmt.Fprintf(os.Stderr, "wackyacp claudesdk: worker stdout read error: %v\n", err)
 	}
 	_ = cmd.Wait()
-	d.shutdownWorker()
+	d.shutdownWorker(gen)
 }
 
 func (d *Driver) dispatch(ev *workerEvent) {
@@ -565,8 +645,13 @@ func (d *Driver) Close() error {
 }
 
 // shutdownWorker marks the worker dead and fails everything still waiting.
-func (d *Driver) shutdownWorker() {
+func (d *Driver) shutdownWorker(gen int64) {
 	d.mu.Lock()
+	if gen != d.generation {
+		// A superseded worker's read loop must not tear down the current one.
+		d.mu.Unlock()
+		return
+	}
 	if !isClosed(d.gone) {
 		close(d.gone)
 	}
@@ -574,6 +659,7 @@ func (d *Driver) shutdownWorker() {
 	d.pending = make(map[int64]chan *workerEvent)
 	d.callbacks = make(map[int64]*acp.TurnCallbacks)
 	d.cmd = nil
+	d.stdin = nil
 	d.enc = nil
 	if !isClosed(d.ready) {
 		d.readyErr = errors.New("claudesdk: worker exited before ready")

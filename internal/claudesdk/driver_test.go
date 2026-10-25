@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -20,7 +23,12 @@ const fakeWorkerEnv = "WACKYACP_FAKE_WORKER"
 
 // TestHelperFakeWorker is not a test. It is the canned worker the driver spawns
 // when WACKYACP_FAKE_WORKER names a scenario, so the frame protocol, the resume
-// retry and cancellation are all exercised without node or a Claude session.
+// retry, cancellation and multi-turn worker reuse are all exercised without node
+// or a Claude session.
+//
+// Scenario "multi" answers every prompt and never exits, and reports the
+// snapshot flag it was given as the stop reason, so a test can watch one worker
+// serve several turns and see the prompt-cache decision.
 func TestHelperFakeWorker(t *testing.T) {
 	if os.Getenv(fakeWorkerEnv) == "" {
 		t.Skip("helper process for driver tests")
@@ -30,6 +38,7 @@ func TestHelperFakeWorker(t *testing.T) {
 
 	out(workerEvent{Type: frameReady})
 
+	turn := 0
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var frame map[string]any
@@ -39,8 +48,6 @@ func TestHelperFakeWorker(t *testing.T) {
 		if frame["type"] == toolResponseFrame {
 			if scenario == "scratchpad" {
 				text, _ := frame["text"].(string)
-				id, _ := frame["requestId"].(float64)
-				_ = id
 				out(workerEvent{Type: frameResult, ID: 1, StopReason: text, SessionID: "sess-1"})
 			}
 			continue
@@ -63,6 +70,18 @@ func TestHelperFakeWorker(t *testing.T) {
 				out(workerEvent{Type: frameResult, ID: reqID, SessionID: sid, StopReason: "end_turn",
 					Usage: &usageFrame{InputTokens: 3, OutputTokens: 4, TotalTokens: 7}})
 				os.Exit(0)
+			case "multi":
+				turn++
+				out(workerEvent{Type: frameEvent, ID: reqID, Kind: kindText, Text: fmt.Sprintf("turn-%d", turn)})
+				snapshot := false
+				if spec, ok := frame["systemPrompt"].(map[string]any); ok {
+					snapshot, _ = spec["snapshot"].(bool)
+				}
+				if sid == "" {
+					sid = "sess-multi"
+				}
+				out(workerEvent{Type: frameResult, ID: reqID, SessionID: sid,
+					StopReason: fmt.Sprintf("snapshot=%v", snapshot)})
 			case "scratchpad":
 				out(workerEvent{Type: frameToolRequest, RequestID: 1, Name: "create_scratchpad",
 					Args: map[string]any{"text": "deposited by claude", "createdBy": "unit-test"}})
@@ -80,20 +99,58 @@ func TestHelperFakeWorker(t *testing.T) {
 	}
 }
 
+// spawnRecorder captures what the driver handed to Spawn, so a test can prove
+// the worker is bound to the bridge lifetime and not to one turn.
+type spawnRecorder struct {
+	mu       sync.Mutex
+	ctx      context.Context
+	killed   int
+	scenario string
+}
+
+func (r *spawnRecorder) set(ctx context.Context) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ctx = ctx
+}
+
+func (r *spawnRecorder) spawnedContext() context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ctx
+}
+
+// spawn binds the child to the context it is given, exactly as production does
+// with exec.CommandContext. This is what makes the worker-lifetime contract
+// testable: hand it a per-turn context and the child dies with that turn.
+func (r *spawnRecorder) spawn(ctx context.Context) (*exec.Cmd, error) {
+	r.set(ctx)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperFakeWorker")
+	cmd.Env = append(os.Environ(), fakeWorkerEnv+"="+r.scenario)
+	return cmd, nil
+}
+
+// newTestDriver keeps the single-turn tests terse; the spawn is still bound to
+// whatever context the driver passes, so production semantics apply.
 func newTestDriver(t *testing.T, scenario string, sessionID string) *Driver {
-	t.Helper()
-	ws := t.TempDir()
-	agentDir := filepath.Join(ws, "claude")
-	writeFile(t, filepath.Join(agentDir, "AGENTS.md"), "test agent"+nl)
-	d, err := New(Config{
-		AgentFolder: agentDir,
-		SessionID:   sessionID,
-		Spawn: func(ctx context.Context) (*exec.Cmd, error) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestHelperFakeWorker")
-			cmd.Env = append(os.Environ(), fakeWorkerEnv+"="+scenario)
-			return cmd, nil
-		},
+	return newRecordingDriver(t, scenario, func(cfg *Config) {
+		cfg.SessionID = sessionID
 	})
+}
+
+func newRecordingDriver(t *testing.T, scenario string, extra func(*Config)) *Driver {
+	t.Helper()
+	agentDir := filepath.Join(t.TempDir(), "claude")
+	writeFile(t, filepath.Join(agentDir, "AGENTS.md"), "test agent"+nl)
+	rec := &spawnRecorder{scenario: scenario}
+	cfg := Config{
+		AgentFolder: agentDir,
+		Spawn:       rec.spawn,
+	}
+	if extra != nil {
+		extra(&cfg)
+	}
+	d, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -123,7 +180,7 @@ func TestDriverPromptMapsChunksToolsAndUsage(t *testing.T) {
 		t.Errorf("chunks = %q, want two framing hello world", got)
 	}
 	if len(tools) != 1 || tools[0] != "Bash" {
-		t.Errorf("tool calls = %v, want [Bash]", tools)
+		t.Errorf("tool calls = %v, want [Bash]", tools[0:0])
 	}
 	if len(statuses) != 1 || statuses[0] != acp.ToolStatusCompleted {
 		t.Errorf("tool updates = %v, want [completed]", statuses)
@@ -139,6 +196,93 @@ func TestDriverPromptMapsChunksToolsAndUsage(t *testing.T) {
 	}
 	if d.SessionID() == "" {
 		t.Errorf("driver did not adopt a session id")
+	}
+}
+
+// TestDriverReusesOneWorkerAcrossTurns is the guard for the worker lifetime
+// contract. Each turn gets its own context that is cancelled when the turn
+// returns, which is what D112 does with a gRPC stream context. If the worker is
+// bound to that context it dies at cancel(), the next turn silently starts a new
+// one, and the killed process is only reclaimed by luck.
+func TestDriverReusesOneWorkerAcrossTurns(t *testing.T) {
+	d := newRecordingDriver(t, "multi", nil)
+
+	firstPID := 0
+	for i := 1; i <= 3; i++ {
+		var got string
+		cbs := acp.TurnCallbacks{OnChunk: func(text string) error { got += text; return nil }}
+
+		turnCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		res, err := d.Prompt(turnCtx, "", fmt.Sprintf("turn %d", i), cbs)
+		cancel()
+		if err != nil {
+			t.Fatalf("turn %d: %v", i, err)
+		}
+		if want := fmt.Sprintf("turn-%d", i); got != want {
+			t.Fatalf("turn %d echoed %q, want %q", i, got, want)
+		}
+		if res.StopReason == "" {
+			t.Fatalf("turn %d returned no stop reason", i)
+		}
+		pid := d.workerPID()
+		if pid == 0 {
+			t.Fatalf("turn %d: driver lost track of the worker process", i)
+		}
+		if firstPID == 0 {
+			firstPID = pid
+		} else if pid != firstPID {
+			t.Fatalf("turn %d ran on worker pid %d, turn 1 used pid %d: the worker is bound to the per-turn context, so every later turn restarts or leaks a node process", i, pid, firstPID)
+		}
+	}
+
+	// The context the worker was spawned with must still be live after three
+	// turns whose own contexts are all cancelled.
+	if ctx := d.spawnedWorkerContext(); ctx == nil {
+		t.Errorf("driver never recorded a spawn context")
+	} else if ctx.Err() != nil {
+		t.Errorf("worker context is already done (%v); it is bound to a turn, not the bridge", ctx.Err())
+	}
+
+	if err := d.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if processExists(firstPID) {
+		t.Errorf("worker pid %d survived Close: orphaned process", firstPID)
+	}
+}
+
+// TestDriverResumesAfterWorkerDeath proves a dead worker is recoverable and that
+// the per-worker handshake channels are real: the driver must wait for the NEW
+// worker's ready frame instead of returning a stale closed-channel signal.
+func TestDriverResumesAfterWorkerDeath(t *testing.T) {
+	d := newRecordingDriver(t, "multi", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := d.Prompt(ctx, "", "first", acp.TurnCallbacks{}); err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	pid := d.workerPID()
+	if pid == 0 {
+		t.Fatalf("no worker pid")
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("FindProcess %d: %v", pid, err)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatalf("kill worker %d: %v", pid, err)
+	}
+	// Give the read loop a moment to reap it, as a real crash would.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && d.workerPID() == pid {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := d.Prompt(ctx, "", "second after crash", acp.TurnCallbacks{}); err != nil {
+		t.Fatalf("turn after worker death must respawn and succeed, got %v", err)
+	}
+	if newPID := d.workerPID(); newPID == pid {
+		t.Errorf("driver reported the dead worker pid %d again", pid)
 	}
 }
 
@@ -194,6 +338,10 @@ func TestDriverContextCancelReturnsAndDoesNotHang(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want context.DeadlineExceeded", err)
 	}
+	// The worker must survive a cancelled turn: cancellation is not a crash.
+	if d.workerPID() == 0 {
+		t.Errorf("worker went away with the cancelled turn context")
+	}
 }
 
 func TestDriverConfigOptionSurfaceIsExplicitlyEmpty(t *testing.T) {
@@ -204,4 +352,12 @@ func TestDriverConfigOptionSurfaceIsExplicitlyEmpty(t *testing.T) {
 	if _, err := d.SetConfigOption(context.Background(), "s", "mode", "yolo"); err == nil {
 		t.Errorf("SetConfigOption must refuse in SDK-direct mode, not accept silently")
 	}
+}
+
+func processExists(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
