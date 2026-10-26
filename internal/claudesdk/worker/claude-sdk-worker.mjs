@@ -109,6 +109,20 @@ const mcpServers = scratchpad.server ? { wackypub: scratchpad.server } : {};
 
 let active = null;
 
+// interruptActive keeps a rejected interrupt() from ending the process. The SDK
+// returns a promise, and an unhandled rejection would take the whole worker down -
+// and every other in-flight request with it - rather than just the turn that was
+// being cancelled.
+function interruptActive() {
+  if (!active || typeof active.interrupt !== 'function') return;
+  const report = (err) => process.stderr.write('wackyacp claudesdk worker: interrupt failed, the turn may still be running: ' + String((err && err.message) || err) + String.fromCharCode(10));
+  try {
+    Promise.resolve(active.interrupt()).catch(report);
+  } catch (err) {
+    report(err);
+  }
+}
+
 function summarize(input) {
   try {
     const s = typeof input === 'string' ? input : JSON.stringify(input);
@@ -304,7 +318,7 @@ rl.on('line', (line) => {
     return;
   }
   if (frame.op === 'cancel') {
-    if (active && typeof active.interrupt === 'function') active.interrupt();
+    interruptActive();
     return;
   }
   if (frame.op === 'prompt') {
