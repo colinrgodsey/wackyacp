@@ -81,6 +81,7 @@ type Driver struct {
 	spawnMu    sync.Mutex
 	cmd        *exec.Cmd
 	workerCtx  context.Context
+	workerDone chan struct{}
 	generation int64
 	stdin      io.WriteCloser
 	enc        *json.Encoder
@@ -251,6 +252,15 @@ func (d *Driver) spawnedWorkerContext() context.Context {
 	return d.workerCtx
 }
 
+// doneSignal returns the current worker completion channel, which readLoop
+// closes after reaping the process. It is the only join point Close may use,
+// because readLoop is the single owner of cmd.Wait.
+func (d *Driver) doneSignal() chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.workerDone
+}
+
 func (d *Driver) readySignal() chan struct{} {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -270,6 +280,7 @@ func (d *Driver) startWorker() error {
 	d.ready = make(chan struct{})
 	d.gone = make(chan struct{})
 	d.readyErr = nil
+	d.workerDone = make(chan struct{})
 	d.mu.Unlock()
 
 	life := d.cfg.BridgeCtx
@@ -325,7 +336,7 @@ func (d *Driver) startWorker() error {
 	d.enc = json.NewEncoder(stdin)
 	d.mu.Unlock()
 
-	go d.readLoop(stdout, cmd, gen)
+	go d.readLoop(stdout, cmd, gen, d.doneSignal())
 	return nil
 }
 
@@ -350,7 +361,12 @@ func (d *Driver) failStart(gen int64, reason error) {
 
 // readLoop demultiplexes worker frames. One goroutine per worker; it returns
 // when the worker closes stdout.
-func (d *Driver) readLoop(stdout io.Reader, cmd *exec.Cmd, gen int64) {
+func (d *Driver) readLoop(stdout io.Reader, cmd *exec.Cmd, gen int64, done chan struct{}) {
+	defer func() {
+		if done != nil {
+			close(done)
+		}
+	}()
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
@@ -653,23 +669,29 @@ func (d *Driver) Cancel(sessionID string) error {
 func (d *Driver) Close() error {
 	d.mu.Lock()
 	cmd := d.cmd
+	done := d.workerDone
 	d.cmd = nil
 	d.stdin = nil
 	d.enc = nil
+	d.workerDone = nil
 	d.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 	_ = cmd.Process.Signal(os.Interrupt)
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(closeGrace):
-		_ = cmd.Process.Kill()
+	// readLoop owns cmd.Wait, so Close joins on its completion channel instead of
+	// waiting a second time: two Waits on one Cmd race on its fields, and Go 1.25
+	// turns that into a panic inside awaitGoroutines.
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(closeGrace):
+			_ = cmd.Process.Kill()
+			select {
+			case <-done:
+			case <-time.After(closeGrace):
+			}
+		}
 	}
 	return nil
 }
@@ -689,6 +711,7 @@ func (d *Driver) shutdownWorker(gen int64) {
 	d.pending = make(map[int64]chan *workerEvent)
 	d.callbacks = make(map[int64]*acp.TurnCallbacks)
 	d.cmd = nil
+	d.workerDone = nil
 	d.stdin = nil
 	d.enc = nil
 	if !isClosed(d.ready) {
