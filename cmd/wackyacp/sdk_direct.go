@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -72,6 +73,7 @@ func runSDKDirect(o sdkDirectOptions) error {
 	// a lock a dead claude died holding before spawning anything. The SDK worker
 	// leaves claude children that can die holding the very same lock.
 	recoverOAuthRefreshLock(o.agentFolder, o.claudeDir, os.Stderr)
+	warnIfClaudeMarkdown(o.agentFolder, os.Stderr)
 
 	drv, err := claudesdk.New(claudesdk.Config{
 		AgentFolder:           o.agentFolder,
@@ -143,5 +145,23 @@ func recoverOAuthRefreshLock(agentFolder, claudeDir string, stderr io.Writer) {
 		Stderr:      stderr,
 	}); err != nil {
 		fmt.Fprintln(stderr, "wackyacp: warning: checking oauth refresh lock:", err)
+	}
+}
+
+// claudeMarkdownName is the file Claude Code loads as project instructions when
+// settingSources includes "project", which it must for .claude/skills discovery.
+const claudeMarkdownName = "CLAUDE.md"
+
+// warnIfClaudeMarkdown flags the one way SDK-direct mode can silently load two
+// sets of instructions: a CLAUDE.md in the agent folder would be layered on top
+// of the wackypub-rendered prompt, doubling and partly overriding it. Nothing
+// creates such a file today, so this is a tripwire, not a fix.
+func warnIfClaudeMarkdown(agentFolder string, stderr io.Writer) {
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	if _, err := os.Stat(filepath.Join(agentFolder, claudeMarkdownName)); err == nil {
+		fmt.Fprintln(stderr, "wackyacp: warning:", filepath.Join(agentFolder, claudeMarkdownName),
+			"will be loaded by the SDK as project instructions on top of the composed AGENTS.md prompt")
 	}
 }

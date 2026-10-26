@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,5 +48,24 @@ func TestSDKModeLeavesLiveOAuthRefreshLockAlone(t *testing.T) {
 
 	if _, err := os.Stat(lock); err != nil {
 		t.Errorf("a live oauth refresh lock was removed: %v", err)
+	}
+}
+
+func TestSDKModeWarnsWhenCLAUDEMarkdownWouldDoubleLoad(t *testing.T) {
+	agentFolder := t.TempDir()
+
+	var stderr bytes.Buffer
+	warnIfClaudeMarkdown(agentFolder, &stderr)
+	if stderr.Len() != 0 {
+		t.Errorf("an agent folder without CLAUDE.md produced a warning: %q", stderr.String())
+	}
+
+	if err := os.WriteFile(filepath.Join(agentFolder, claudeMarkdownName), []byte("project instructions"), 0o644); err != nil {
+		t.Fatalf("writing CLAUDE.md: %v", err)
+	}
+	stderr.Reset()
+	warnIfClaudeMarkdown(agentFolder, &stderr)
+	if !strings.Contains(stderr.String(), claudeMarkdownName) {
+		t.Errorf("expected a warning that the SDK would load CLAUDE.md alongside the composed prompt, got %q", stderr.String())
 	}
 }
