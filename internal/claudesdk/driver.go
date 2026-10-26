@@ -58,6 +58,9 @@ type Config struct {
 	// replacing the per-edit permission prompts the ACP adapter generated.
 	AdditionalDirectories []string
 	PermissionMode        string
+	// Model is handed to the SDK per query. Empty means let Claude resolve it, which
+	// is the behavior every bridge that sets nothing relies on.
+	Model string
 	// OnSessionEstablished fires with the session id after the first successful
 	// turn, so the bridge can persist an id it created itself.
 	OnSessionEstablished func(sessionID string)
@@ -597,6 +600,7 @@ func (d *Driver) runTurn(ctx context.Context, sid string, resume bool, promptTex
 		AdditionalDirectories: d.cfg.AdditionalDirectories,
 		SettingSources:        []string{"user", "project", "local"},
 		PermissionMode:        d.cfg.PermissionMode,
+		Model:                 d.cfg.Model,
 	}
 	if resume {
 		req.Resume = true

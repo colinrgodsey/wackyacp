@@ -65,6 +65,10 @@ type workerRequest struct {
 	AdditionalDirectories []string          `json:"additionalDirectories,omitempty"`
 	SettingSources        []string          `json:"settingSources,omitempty"`
 	PermissionMode        string            `json:"permissionMode,omitempty"`
+	// Model selects the model for this query. Empty is not a value: the field is
+	// left out of the frame entirely so an unconfigured bridge keeps Claude's own
+	// resolution.
+	Model string `json:"model,omitempty"`
 }
 
 // usageFrame mirrors the SDK usage counters onto wackyacp's UsageMetrics shape.

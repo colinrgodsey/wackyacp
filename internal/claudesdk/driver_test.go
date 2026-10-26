@@ -86,6 +86,13 @@ func TestHelperFakeWorker(t *testing.T) {
 			case "scratchpad":
 				out(workerEvent{Type: frameToolRequest, RequestID: 1, Name: "create_scratchpad",
 					Args: map[string]any{"text": "deposited by claude", "createdBy": "unit-test"}})
+			case "model":
+				if v, ok := frame["model"]; ok {
+					out(workerEvent{Type: frameResult, ID: reqID, SessionID: sid, StopReason: "model=" + fmt.Sprint(v)})
+				} else {
+					out(workerEvent{Type: frameResult, ID: reqID, SessionID: sid, StopReason: "model-absent"})
+				}
+				os.Exit(0)
 			case "resume-fail":
 				if resume {
 					out(workerEvent{Type: frameError, ID: reqID, Code: codeResumeFailed, Message: "no transcript at this id"})
@@ -431,5 +438,49 @@ func TestPromptDigestSurvivesDriverRestart(t *testing.T) {
 	}
 	if res.StopReason != "snapshot=true" {
 		t.Errorf("a restarted bridge sent %q: it lost the prompt digest and forced a cache miss", res.StopReason)
+	}
+}
+
+// TestDriverSendsModelOnlyWhenConfigured is the frame-level contract for
+// --model: configured means the field arrives, unconfigured means the key is
+// absent so Claude keeps its own default resolution.
+func TestDriverSendsModelOnlyWhenConfigured(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	set := newRecordingDriver(t, "model", func(cfg *Config) { cfg.Model = "claude-opus-4-1" })
+	res, err := set.Prompt(ctx, "", "which model", acp.TurnCallbacks{})
+	if err != nil {
+		t.Fatalf("prompt with a configured model: %v", err)
+	}
+	if res.StopReason != "model=claude-opus-4-1" {
+		t.Errorf("worker saw %q, want the configured model to arrive in the request frame", res.StopReason)
+	}
+
+	unset := newRecordingDriver(t, "model", nil)
+	res, err = unset.Prompt(ctx, "", "which model", acp.TurnCallbacks{})
+	if err != nil {
+		t.Fatalf("prompt without a model: %v", err)
+	}
+	if res.StopReason != "model-absent" {
+		t.Errorf("worker saw %q: an unset model must be omitted from the frame, not sent empty", res.StopReason)
+	}
+}
+
+func TestWorkerRequestMarshalsModelOnlyWhenSet(t *testing.T) {
+	data, err := json.Marshal(workerRequest{ID: 1, Op: opPrompt})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "model") {
+		t.Errorf("empty model must not appear in the frame at all, got %s", data)
+	}
+
+	data, err = json.Marshal(workerRequest{ID: 1, Op: opPrompt, Model: "claude-sonnet-4"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"model":"claude-sonnet-4"`) {
+		t.Errorf("configured model missing from the frame, got %s", data)
 	}
 }
