@@ -37,7 +37,13 @@ const (
 )
 
 // systemPromptSpec is how the composed prompt is handed to the worker.
-// Mode is "append" (keep the claude_code preset) or "replace" (custom prompt).
+// Mode "append" keeps Claude Code's own preset and is the default. Mode
+// "replace" asks for a custom prompt and is NOT viable against the pinned CLI:
+// the bundled binary bakes SystemPromptPreset into the outgoing request, so the
+// CLI rejects a custom prompt instead of half-applying it. That finding is
+// claude's, verified against cli.js and a live probe; I did not re-run it.
+// Keeping the mode separate from the content is what lets a future CLI that
+// honours custom prompts turn this on without a bridge contract change.
 type systemPromptSpec struct {
 	Mode    string `json:"mode"`
 	Content string `json:"content"`
