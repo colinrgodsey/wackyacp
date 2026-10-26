@@ -2,6 +2,7 @@ package claudesdk
 
 import (
 	"context"
+	"github.com/colinrgodsey/wackyacp/internal/acp"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,5 +89,72 @@ func TestWorkerPathIsContentAddressed(t *testing.T) {
 	}
 	if a != b {
 		t.Errorf("two drivers with the same embedded script chose %q and %q; they should share one file", a, b)
+	}
+}
+
+// stubSDKModel records the options the worker actually passed to query() and
+// smuggles the model back through session_id, so a Go assertion can prove the
+// --model flag reaches the SDK rather than stopping in a frame.
+const stubSDKModel = `
+export function query(req) {
+  const options = (req && req.options) || {};
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield {
+        type: 'result',
+        subtype: 'success',
+        session_id: options.model ? String(options.model) : 'claude-default',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    },
+    interrupt() { return Promise.resolve(); },
+  };
+}
+
+export function createSdkMcpServer() { return { name: 'wackypub' }; }
+export function tool() { return {}; }
+`
+
+// TestWorkerPassesModelToQueryOptions is the end-to-end leg: driver config over
+// the real frame protocol into real node and into query options.
+func TestWorkerPassesModelToQueryOptions(t *testing.T) {
+	nodeBin := requireNode(t)
+
+	agentDir := filepath.Join(t.TempDir(), "claude")
+	writeFile(t, filepath.Join(agentDir, "AGENTS.md"), "test agent"+nl)
+	sdkDir := filepath.Join(t.TempDir(), "sdk")
+	writeFile(t, filepath.Join(sdkDir, "sdk.mjs"), stubSDKModel)
+	writeFile(t, filepath.Join(sdkDir, "package.json"), `{"type":"module"}`)
+
+	cases := []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{"configured", "claude-opus-4-1", "claude-opus-4-1"},
+		{"unset leaves the default", "", "claude-default"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := New(Config{
+				AgentFolder: agentDir,
+				NodeBin:     nodeBin,
+				SDKDir:      sdkDir,
+				Model:       tc.model,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer func() { _ = d.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if _, err := d.Prompt(ctx, "", "which model ran", acp.TurnCallbacks{}); err != nil {
+				t.Fatalf("Prompt: %v", err)
+			}
+			if got := d.SessionID(); got != tc.want {
+				t.Errorf("query() received model %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

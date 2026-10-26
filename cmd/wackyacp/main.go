@@ -27,6 +27,7 @@ func run() error {
 	nodeBin := flag.String("node-bin", "node", "claude-sdk only: node executable that runs the SDK worker")
 	additionalDirs := flag.String("additional-directories", "", "claude-sdk only: comma-separated directories the SDK may work in outside the agent folder, replacing per-edit permission prompts")
 	claudeDir := flag.String("claude-dir", "", "claude-sdk only: Claude configuration directory to probe for a stale OAuth refresh lock (default: resolve as the ACP path does)")
+	model := flag.String("model", "", "claude-sdk only: model the SDK should run for every turn (default: leave Claude's own resolution alone)")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: wackyacp [flags] (bridge dispatch mode)")
@@ -57,6 +58,7 @@ func run() error {
 			nodeBin:          *nodeBin,
 			additionalDirs:   *additionalDirs,
 			claudeDir:        *claudeDir,
+			model:            *model,
 		})
 	}
 	if *driver != driverACP {

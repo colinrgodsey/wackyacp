@@ -219,6 +219,9 @@ async function runPrompt(req) {
     mcpServers,
   };
   if (Array.isArray(req.skills)) options.skills = req.skills;
+  // Only send a model when one was configured: omitting it leaves Claude's own
+  // default resolution intact for every bridge that sets nothing.
+  if (typeof req.model === 'string' && req.model) options.model = req.model;
 
   // append keeps Claude Code's own instructions; replace sends only wackypub's.
   if (spec.mode === 'replace') {
@@ -248,6 +251,14 @@ async function runPrompt(req) {
         const delta = msg.event && msg.event.delta;
         if (delta && delta.type === 'text_delta' && delta.text) {
           out({ type: 'event', id: req.id, kind: 'text', text: delta.text });
+        }
+      } else if (msg.type === 'system' && msg.subtype === 'init') {
+        // Operators need to see which model actually ran, not which one was asked
+        // for. Field naming varies across SDK builds, so report whichever is there
+        // and stay silent rather than guess.
+        const resolved = msg.resolvedModel || msg.canonicalModel || msg.model;
+        if (resolved) {
+          process.stderr.write('wackyacp claudesdk worker: turn running on model ' + String(resolved) + String.fromCharCode(10));
         }
       } else if (msg.type === 'assistant') {
         for (const block of (msg.message && msg.message.content) || []) {

@@ -34,6 +34,9 @@ type sdkDirectOptions struct {
 	// stale OAuth lock probe inspects. Empty resolves the same way the ACP
 	// path resolves it.
 	claudeDir string
+	// model is passed to the SDK on every turn. Empty leaves Claude to resolve its
+	// own default.
+	model string
 }
 
 // runSDKDirect serves the same D112 gRPC surface as the ACP path, backed by the
@@ -78,6 +81,7 @@ func runSDKDirect(o sdkDirectOptions) error {
 	drv, err := claudesdk.New(claudesdk.Config{
 		AgentFolder:           o.agentFolder,
 		BridgeCtx:             ctx,
+		Model:                 o.model,
 		SystemPromptMode:      mode,
 		SessionID:             savedID,
 		NodeBin:               o.nodeBin,
