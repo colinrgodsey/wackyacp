@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,9 @@ const (
 	DefaultSDKDir  = "/home/dranbo/node_modules/.pnpm/node_modules/@anthropic-ai/claude-agent-sdk"
 	sdkDirEnvVar   = "WACKYACP_CLAUDE_SDK_DIR"
 	workerFileName = "claude-sdk-worker.mjs"
+	// workerFileExt must be the last element of a materialized file name:
+	// node derives the module format from the suffix.
+	workerFileExt = ".mjs"
 
 	// defaultPermissionMode removes the ACP session/request_permission round
 	// trip. The bridge is a trusted local process and wackypub already decides
@@ -162,12 +166,32 @@ func (d *Driver) workerPath() (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("creating worker dir %s: %w", dir, err)
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%s-%s", workerFileName, contentTag(src)))
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == src {
+	// The extension has to come last. Node derives the module format from the
+	// file suffix, so a name like claude-sdk-worker.mjs-<tag> dies with
+	// ERR_UNKNOWN_FILE_EXTENSION before it can report anything useful. The tag is
+	// the content digest: concurrent bridges share one file, and a rebuilt binary
+	// gets a different name instead of rewriting a script another bridge is
+	// still executing.
+	path := filepath.Join(dir, "claude-sdk-worker-"+contentTag(src)+workerFileExt)
+	if sameFile(path, src) {
 		return path, nil
 	}
-	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		if sameFile(path, src) {
+			return path, nil
+		}
+		return writePrivateWorker(dir, src)
+	}
+	if err != nil {
+		return "", fmt.Errorf("creating worker script %s: %w", path, err)
+	}
+	if _, err := f.Write([]byte(src)); err != nil {
+		_ = f.Close()
 		return "", fmt.Errorf("writing worker script %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("closing worker script %s: %w", path, err)
 	}
 	return path, nil
 }
@@ -691,4 +715,28 @@ func newSessionID() string {
 	b[8] = (b[8] & 0x3f) | 0x80
 	h := hex.EncodeToString(b[:])
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// sameFile reports whether path already holds exactly src.
+func sameFile(path, src string) bool {
+	data, err := os.ReadFile(path)
+	return err == nil && string(data) == src
+}
+
+// writePrivateWorker handles the case where a shared worker file exists with
+// different content: write a private copy under a unique name, extension last,
+// rather than clobbering a script that may be running right now.
+func writePrivateWorker(dir, src string) (string, error) {
+	f, err := os.CreateTemp(dir, "claude-sdk-worker-*.mjs")
+	if err != nil {
+		return "", fmt.Errorf("creating private worker script: %w", err)
+	}
+	if _, err := f.Write([]byte(src)); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("writing private worker script: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("closing private worker script: %w", err)
+	}
+	return f.Name(), nil
 }
