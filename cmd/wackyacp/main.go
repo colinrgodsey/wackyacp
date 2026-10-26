@@ -21,6 +21,12 @@ func run() error {
 	harnessArgs := flag.String("harness-args", "", "Arguments for the harness command")
 	agentFolder := flag.String("agent-folder", "", "Absolute path to the agent folder")
 	permissionMode := flag.String("permission-mode", "deny", "How to answer session/request_permission from the harness: deny (D117 default, auto-deny) or approve (auto-approve; trusted local harnesses only)")
+	driver := flag.String("driver", driverACP, "Runtime driver: acp (harness over ACP, default) or claude-sdk (Claude Agent SDK directly, no harness)")
+	systemPromptMode := flag.String("system-prompt-mode", "append", "claude-sdk only: append keeps Claude Code's own preset and adds the wackypub prompt; replace sends only the wackypub prompt")
+	claudeSDKDir := flag.String("claude-sdk-dir", "", "claude-sdk only: directory containing @anthropic-ai/claude-agent-sdk (default: the pinned install)")
+	nodeBin := flag.String("node-bin", "node", "claude-sdk only: node executable that runs the SDK worker")
+	additionalDirs := flag.String("additional-directories", "", "claude-sdk only: comma-separated directories the SDK may work in outside the agent folder, replacing per-edit permission prompts")
+	claudeDir := flag.String("claude-dir", "", "claude-sdk only: Claude configuration directory to probe for a stale OAuth refresh lock (default: resolve as the ACP path does)")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: wackyacp [flags] (bridge dispatch mode)")
@@ -38,6 +44,23 @@ func run() error {
 	}
 	if !filepath.IsAbs(*agentFolder) {
 		return fmt.Errorf("--agent-folder must be an absolute path: %q (no CWD fallback allowed)", *agentFolder)
+	}
+
+	// 1b. claude-sdk mode drives the Claude Agent SDK directly. Everything from
+	// here down is the ACP harness path, unchanged until the REMOTE_MANIFEST
+	// cutover, so rollback is one flag on the claude line.
+	if *driver == driverClaudeSDK {
+		return runSDKDirect(sdkDirectOptions{
+			agentFolder:      *agentFolder,
+			systemPromptMode: *systemPromptMode,
+			sdkDir:           *claudeSDKDir,
+			nodeBin:          *nodeBin,
+			additionalDirs:   *additionalDirs,
+			claudeDir:        *claudeDir,
+		})
+	}
+	if *driver != driverACP {
+		return fmt.Errorf("unknown --driver %q: want %s or %s", *driver, driverACP, driverClaudeSDK)
 	}
 
 	// 2. Validate harness-cmd: LookPath at startup, fail fast (D117 Decision)
