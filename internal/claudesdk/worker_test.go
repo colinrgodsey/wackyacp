@@ -13,6 +13,20 @@ import (
 	"time"
 )
 
+// requireNode skips LOUDLY when the runner has no Node. These are the only
+// tests that start the real worker, so a quiet skip would drop exactly the
+// coverage that caught the materialized file-name bug: the skip message names
+// what went untested and how to get it back.
+func requireNode(t *testing.T) string {
+	t.Helper()
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skipf("NOT COVERED IN THIS RUN: node is not on PATH, so the real %s never started and the worker protocol went unexercised; install Node (CI uses actions/setup-node) before trusting this suite", workerFileName)
+	}
+	t.Logf("real-worker test using %s", nodeBin)
+	return nodeBin
+}
+
 // stubSDK stands in for @anthropic-ai/claude-agent-sdk. Its first query hangs
 // until cancelled and its interrupt() rejects, which is a state the real SDK's
 // types permit and which the Go-stub worker in driver_test.go cannot express,
@@ -71,10 +85,7 @@ func (b *lockedBuffer) String() string {
 // in-flight request down with it, so the handler must swallow it and keep
 // serving.
 func TestWorkerSurvivesRejectedInterrupt(t *testing.T) {
-	nodeBin, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is not installed; the worker is a Node program")
-	}
+	nodeBin := requireNode(t)
 
 	dir := t.TempDir()
 	sdkDir := filepath.Join(dir, "sdk")

@@ -24,6 +24,18 @@ jobs:
           go-version: '1.25.7'
           cache: true
 
+      # The Claude Agent SDK sidecar is a Node program. Without Node the
+      # real-worker tests skip, and CI would silently lose the only check that
+      # the embedded worker actually loads under Node - which is the bug class a
+      # human probe found once before.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Report Node version
+        run: node --version
+
       - name: Check formatting (gofmt)
         run: |
           unformatted=$(gofmt -l .)

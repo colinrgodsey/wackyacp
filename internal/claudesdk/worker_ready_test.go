@@ -3,7 +3,6 @@ package claudesdk
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,10 +15,7 @@ import (
 // suffix, so a materialized name with the extension anywhere other than the end
 // fails here instead of in production with ERR_UNKNOWN_FILE_EXTENSION.
 func TestMaterializedWorkerReachesReady(t *testing.T) {
-	nodeBin, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is not installed; the worker is a Node program")
-	}
+	nodeBin := requireNode(t)
 
 	agentDir := filepath.Join(t.TempDir(), "claude")
 	writeFile(t, filepath.Join(agentDir, "AGENTS.md"), "test agent"+nl)
