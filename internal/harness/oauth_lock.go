@@ -46,10 +46,7 @@ func RecoverStaleOAuthLock(cfg Config) (bool, error) {
 		return false, nil
 	}
 
-	threshold := cfg.OAuthLockStaleThreshold
-	if threshold <= 0 {
-		threshold = DefaultOAuthLockStaleThreshold
-	}
+	threshold := DefaultOAuthLockStaleThreshold
 
 	stderr := cfg.Stderr
 	if stderr == nil {
@@ -422,24 +419,27 @@ func claudeCandidateDirs(cfg Config) []string {
 	return dirs
 }
 
-// isClaudeTarget checks if the harness invocation is associated with Claude.
-// Note: this intentionally uses substring matching (rather than exact binary or folder name
-// equality) so that paths like /abs/path/to/claude-agent-acp, arguments like
-// -y @agentclientprotocol/claude-agent-acp, and folders like /home/.../workspace/claude all match.
+// isClaudeTarget reports whether the harness invocation is associated with Claude:
+// an explicitly configured ClaudeDir, or a binary/agent folder whose path has a
+// component that is exactly "claude". The match is deliberately structural rather
+// than substring-based: a substring match fires on any path that merely contains
+// the word (a temp dir named after a test, an unrelated project folder), which
+// both misclassified non-claude harnesses and let their tests flake.
 func isClaudeTarget(cfg Config) bool {
 	if cfg.ClaudeDir != "" {
 		return true
 	}
-	if strings.Contains(strings.ToLower(cfg.Command), "claude") {
-		return true
+	return hasClaudePathComponent(cfg.Command) || hasClaudePathComponent(cfg.AgentFolder)
+}
+
+func hasClaudePathComponent(p string) bool {
+	if p == "" {
+		return false
 	}
-	for _, arg := range cfg.Args {
-		if strings.Contains(strings.ToLower(arg), "claude") {
+	for _, part := range strings.Split(filepath.ToSlash(filepath.Clean(p)), "/") {
+		if part == "claude" {
 			return true
 		}
-	}
-	if strings.Contains(strings.ToLower(cfg.AgentFolder), "claude") {
-		return true
 	}
 	return false
 }

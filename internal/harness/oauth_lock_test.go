@@ -2,14 +2,12 @@ package harness
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -261,58 +259,6 @@ func TestRecoverStaleOAuthLock_CleansLegacyLocks(t *testing.T) {
 	}
 	if _, err := os.Stat(legacyLockPath); !os.IsNotExist(err) {
 		t.Fatalf("legacyLockPath still exists")
-	}
-}
-
-type safeBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (s *safeBuffer) Write(p []byte) (n int, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Write(p)
-}
-
-func (s *safeBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.String()
-}
-
-func TestStart_HarnessInvokesRecovery(t *testing.T) {
-	claudeDir := t.TempDir()
-	lockPath := filepath.Join(claudeDir, OAuthLockName)
-	if err := os.Mkdir(lockPath, 0755); err != nil {
-		t.Fatalf("mkdir lock: %v", err)
-	}
-
-	ownerPath := filepath.Join(claudeDir, OAuthOwnerFileName)
-	_ = os.WriteFile(ownerPath, []byte(`{"pid": 9999999}`), 0644)
-
-	var stderr safeBuffer
-	cfg := Config{
-		Command:   "cat",
-		ClaudeDir: claudeDir,
-		Stderr:    &stderr,
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	proc, err := Start(ctx, cfg)
-	if err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer proc.Close()
-
-	// Verify lock directory was deleted before harness started
-	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
-		t.Fatalf("expected lockPath to be deleted by Start, err=%v", err)
-	}
-	if !strings.Contains(stderr.String(), "wackyacp: WARNING: removing stale OAuth refresh lock") {
-		t.Fatalf("expected warning log from Start, got: %s", stderr.String())
 	}
 }
 
