@@ -59,11 +59,12 @@ Per-turn flow: acquire `acp-session.lock` → read/verify session file → spawn
 ## CLI surface
 
 The CLI carries its own flag documentation: every surface prints its full flag
-catalog on request. The README below only points at those and records the
+catalog on request. See **[docs/cli.md](docs/cli.md)** for the command-by-command
+reference with examples and expected output; the README below only records the
 behavioral contracts the help text cannot convey.
 
 ```bash
-wackyacp --help                 # bridge dispatch mode (harness flags)
+wackyacp --help                 # bridge dispatch mode (harness + claude-sdk driver flags)
 wackyacp serve --help           # serve mode: stdio, TCP, and --remote dial
 wackyacp model --help           # model get|set
 wackyagy --help                 # wackyagy bridge flags
@@ -77,18 +78,20 @@ the contract:
 ```bash
 agy:           wackyacp --harness-cmd=agy --harness-args='--prompt' --agent-folder=/abs/path/to/agy
 claude-review: wackyacp --harness-cmd=npx --harness-args='-y @agentclientprotocol/claude-agent-acp' --agent-folder=/abs/path/to/claude-review
+claude-sdk:    wackyacp --driver=claude-sdk --agent-folder=/abs/path/to/claude
 ```
 
-`--agent-folder` must be absolute (no CWD fallback, by decision). Per-turn flow:
+`--agent-folder` must be absolute (no CWD fallback, by decision). Two runtime
+drivers: `--driver=acp` (default; harness subprocess over ACP) and
+`--driver=claude-sdk` (direct Claude Agent SDK - no harness, no ACP layer; see
+docs/cli.md for its flags). Per-turn flow:
 acquire `acp-session.lock` -> read/verify session file -> spawn harness
 (process-group isolated) -> ACP `initialize` -> resume/load/new -> serve D112 on
 stdio until stdin EOF -> release lock, reap child. Delete `acp-session.json` to
 reset an agent. `--permission-mode deny` (D117 default) auto-denies harness
 permission requests with a warning chunk; `approve` grants everything, so it is
 only for trusted local harnesses. It is read by dispatch mode and the model CLI;
-serve mode does not accept it (no harness to ask).
-
-### `wackyacp model get|set`
+serve mode does not accept it (no harness to ask).### `wackyacp model get|set`
 
 Per-agent model inspection/selection (ACP config-option passthrough):
 
